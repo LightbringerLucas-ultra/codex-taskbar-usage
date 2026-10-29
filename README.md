@@ -2,6 +2,12 @@
 
 Windows 任务栏上的独立小组件，显示当前 Codex 账号的 5 小时和每周剩余额度及重置时间，每分钟刷新。额度来自本机 Codex `app-server` 的 `account/rateLimits/read` 接口，不执行模型任务。
 
+## 界面预览
+
+![Codex 任务栏额度看板示意图](docs/preview.svg)
+
+*示意图中的百分比和重置时间为示例，实际显示以当前账号数据及任务栏背景为准。*
+
 ## 使用条件
 
 - Windows，.NET Framework 4.x（构建需要系统自带的 C# 编译器）
