@@ -8,9 +8,9 @@
     <text x="31" y="26" font-family="STHupo, Microsoft YaHei UI, sans-serif" font-size="13" fill="#f6b2c4">外置大脑剩余</text>
     <path d="M115 15v14" stroke="#565963" stroke-width=".75"/>
     <g font-size="11.5" fill="#bbbec6">
-      <text x="127" y="25">每周</text>
+      <text x="127" y="26">每周</text>
     </g>
     <g font-size="13"><text x="161" y="26" fill="#ff7477">22%</text></g>
-    <g font-size="11.5" fill="#b1b4bc"><text x="206.5" y="25">周日 15:40 重置</text></g>
+    <g font-size="11.5" fill="#b1b4bc"><text x="206.5" y="26">周日 15:40 重置</text></g>
   </g>
 </svg>

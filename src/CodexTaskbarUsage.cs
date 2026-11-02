@@ -393,6 +393,7 @@ internal sealed class UsageWidget : Form
                     float textTop = WeeklyOnly ? (Height - font.GetHeight(g)) / 2f : (Height - font.GetHeight(g) - resetFont.GetHeight(g) - lineGap) / 2f;
                     float resetTop = WeeklyOnly ? (Height - resetFont.GetHeight(g)) / 2f : textTop + font.GetHeight(g) + lineGap;
                     float baseline = titleTop + font.Size * font.FontFamily.GetCellAscent(font.Style) / font.FontFamily.GetEmHeight(font.Style);
+                    if (WeeklyOnly) resetTop = baseline - resetFont.Size * resetFont.FontFamily.GetCellAscent(resetFont.Style) / resetFont.FontFamily.GetEmHeight(resetFont.Style);
                     float headingTop = baseline - headingFont.Size * headingFont.FontFamily.GetCellAscent(headingFont.Style) / headingFont.FontFamily.GetEmHeight(headingFont.Style);
                     DrawBrain(g);
                     float titleX = 31*scale;
@@ -413,7 +414,7 @@ internal sealed class UsageWidget : Form
                             g.DrawString(Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(173*scale, textTop), format);
                         g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
                     }
-                    float captionTop = WeeklyOnly ? (Height - weeklyCaptionFont.GetHeight(g)) / 2f : textTop;
+                    float captionTop = WeeklyOnly ? baseline - weeklyCaptionFont.Size * weeklyCaptionFont.FontFamily.GetCellAscent(weeklyCaptionFont.Style) / weeklyCaptionFont.FontFamily.GetEmHeight(weeklyCaptionFont.Style) : textTop;
                     g.DrawString("每周", weeklyCaptionFont, captionBrush, new PointF(weekX, captionTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft, stale)))
                         g.DrawString(weekValue, font, valueBrush, new PointF(valueX, textTop), format);
