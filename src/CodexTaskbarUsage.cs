@@ -377,8 +377,8 @@ internal sealed class UsageWidget : Form
                 // The real taskbar remains visible behind it, including its wallpaper tint.
                 g.Clear(Color.FromArgb(1, 0, 0, 0));
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                using (var font = new Font("Microsoft YaHei UI", 12.7f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (var resetFont = new Font("Microsoft YaHei UI", 9.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var font = new Font("Microsoft YaHei UI", (WeeklyOnly ? 13f : 12.7f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var resetFont = new Font("Microsoft YaHei UI", (WeeklyOnly ? 13f : 9.5f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                 using (var headingFont = new Font("华文琥珀", 13f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                 using (var headingBrush = new SolidBrush(Color.FromArgb(246, 178, 196)))
                 using (var captionBrush = new SolidBrush(Color.FromArgb(187, 190, 198)))
