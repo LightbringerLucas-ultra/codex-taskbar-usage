@@ -378,7 +378,8 @@ internal sealed class UsageWidget : Form
                 g.Clear(Color.FromArgb(1, 0, 0, 0));
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                 using (var font = new Font("Microsoft YaHei UI", (WeeklyOnly ? 13f : 12.7f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (var resetFont = new Font("Microsoft YaHei UI", (WeeklyOnly ? 13f : 9.5f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var resetFont = new Font("Microsoft YaHei UI", (WeeklyOnly ? 11.5f : 9.5f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var weeklyCaptionFont = new Font("Microsoft YaHei UI", (WeeklyOnly ? 11.5f : 12.7f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                 using (var headingFont = new Font("华文琥珀", 13f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                 using (var headingBrush = new SolidBrush(Color.FromArgb(246, 178, 196)))
                 using (var captionBrush = new SolidBrush(Color.FromArgb(187, 190, 198)))
@@ -405,10 +406,24 @@ internal sealed class UsageWidget : Form
                         g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
                     }
                     float weekX = (WeeklyOnly ? 127 : 232) * scale;
-                    g.DrawString("每周", font, captionBrush, new PointF(weekX, textTop), format);
+                    string weekValue = Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
+                    string weekResetLabel = ResetLabel(weekReset, true);
+                    float captionTop = WeeklyOnly ? (Height - weeklyCaptionFont.GetHeight(g)) / 2f : textTop;
+                    float valueX = weekX + 38*scale, resetX = weekX;
+                    if (WeeklyOnly) {
+                        // Spread the three fields evenly across the available row, including
+                        // when the percentage gains a decimal or the stale marker.
+                        float captionWidth = g.MeasureString("每周", weeklyCaptionFont, 1000, format).Width;
+                        float valueWidth = g.MeasureString(weekValue, font, 1000, format).Width;
+                        float resetWidth = g.MeasureString(weekResetLabel, resetFont, 1000, format).Width;
+                        float gap = Math.Max(0, (Width - 8*scale - weekX - captionWidth - valueWidth - resetWidth) / 2f);
+                        valueX = weekX + captionWidth + gap;
+                        resetX = valueX + valueWidth + gap;
+                    }
+                    g.DrawString("每周", weeklyCaptionFont, captionBrush, new PointF(weekX, captionTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft, stale)))
-                        g.DrawString(Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(weekX + 38*scale, textTop), format);
-                    g.DrawString(ResetLabel(weekReset, true), resetFont, resetBrush, new PointF(WeeklyOnly ? 216*scale : weekX, resetTop), format);
+                        g.DrawString(weekValue, font, valueBrush, new PointF(valueX, textTop), format);
+                    g.DrawString(weekResetLabel, resetFont, resetBrush, new PointF(resetX, resetTop), format);
                 }
             }
             IntPtr dc = GetDC(IntPtr.Zero), memory = CreateCompatibleDC(dc);
