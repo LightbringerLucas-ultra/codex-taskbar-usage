@@ -330,7 +330,7 @@ internal sealed class UsageWidget : Form
         float nextScale = dpi / 96f;
         if (nextScale < 1) nextScale = 1;
         scale = nextScale;
-        int width = (int)((WeeklyOnly ? 320 : 316) * scale), height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
+        int width = (int)((WeeklyOnly ? 299 : 316) * scale), height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
         if (height < 20 || r.Right - r.Left < width) { HideWidget("taskbar too small"); return; }
         int x = Math.Max(r.Left + 8, Math.Min(r.Left + (int)(offset * scale), r.Right - width - 8));
         int y = r.Top + (r.Bottom - r.Top - height) / 2;
@@ -355,7 +355,7 @@ internal sealed class UsageWidget : Form
         int h = ClientSize.Height;
         title.SetBounds((int)(10*scale), 0, (int)(98*scale), h);
         five.SetBounds((int)(126*scale), 0, (int)(80*scale), h);
-        week.SetBounds((int)((WeeklyOnly ? 126 : 232)*scale), 0, (int)((WeeklyOnly ? 190 : 80)*scale), h);
+        week.SetBounds((int)((WeeklyOnly ? 126 : 232)*scale), 0, (int)((WeeklyOnly ? 165 : 80)*scale), h);
         float size = 9.5f;
         if (title.Font.Size != size) {
             foreach (var l in new[] { title, five, week }) {
@@ -398,22 +398,13 @@ internal sealed class UsageWidget : Form
                     float titleX = 31*scale;
                     g.DrawString(title.Text, headingFont, headingBrush, new PointF(titleX, headingTop), format);
                     float firstSeparator = 115*scale;
-                    float weekX = 232*scale, valueX = weekX + 38*scale, resetX = weekX;
+                    // Fixed, compact positions; the two gaps are about 11 pixels
+                    // at 96 DPI when the weekly value is 100%.
+                    float weekX = (WeeklyOnly ? 127 : 232)*scale;
+                    float valueX = (WeeklyOnly ? 161 : 270)*scale;
+                    float resetX = (WeeklyOnly ? 206.5f : 232)*scale;
                     string weekValue = Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
                     string weekResetLabel = ResetLabel(weekReset, true);
-                    if (WeeklyOnly) {
-                        // Use equal gaps from the title to each of the three weekly fields.
-                        // Recalculate when the percentage or reset label changes.
-                        float titleWidth = g.MeasureString(title.Text, headingFont, 1000, format).Width;
-                        float captionWidth = g.MeasureString("每周", weeklyCaptionFont, 1000, format).Width;
-                        float valueWidth = g.MeasureString(weekValue, font, 1000, format).Width;
-                        float resetWidth = g.MeasureString(weekResetLabel, resetFont, 1000, format).Width;
-                        float gap = Math.Max(0, (Width - 8*scale - titleX - titleWidth - captionWidth - valueWidth - resetWidth) / 3f);
-                        firstSeparator = titleX + titleWidth + gap / 2f;
-                        weekX = titleX + titleWidth + gap;
-                        valueX = weekX + captionWidth + gap;
-                        resetX = valueX + valueWidth + gap;
-                    }
                     g.DrawLine(separator, firstSeparator, Height/2f-7*scale, firstSeparator, Height/2f+7*scale);
                     if (!WeeklyOnly) {
                         g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
