@@ -187,6 +187,8 @@ internal sealed class UsageWidget : Form
     int dragOrigin;
     Point dragMouse;
     double? fiveLeft, weekLeft;
+    bool hasFive, hasWeek;
+    bool WeeklyOnly { get { return hasWeek && !hasFive; } }
     DateTime? lastUpdated, fiveReset, weekReset;
     string error = "正在读取 Codex 用量";
     float scale = 1;
@@ -328,7 +330,7 @@ internal sealed class UsageWidget : Form
         float nextScale = dpi / 96f;
         if (nextScale < 1) nextScale = 1;
         scale = nextScale;
-        int width = (int)(316 * scale), height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
+        int width = (int)((WeeklyOnly ? 221 : 316) * scale), height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
         if (height < 20 || r.Right - r.Left < width) { HideWidget("taskbar too small"); return; }
         int x = Math.Max(r.Left + 8, Math.Min(r.Left + (int)(offset * scale), r.Right - width - 8));
         int y = r.Top + (r.Bottom - r.Top - height) / 2;
@@ -353,7 +355,7 @@ internal sealed class UsageWidget : Form
         int h = ClientSize.Height;
         title.SetBounds((int)(10*scale), 0, (int)(98*scale), h);
         five.SetBounds((int)(126*scale), 0, (int)(80*scale), h);
-        week.SetBounds((int)(232*scale), 0, (int)(80*scale), h);
+        week.SetBounds((int)((WeeklyOnly ? 126 : 232)*scale), 0, (int)(80*scale), h);
         float size = 9.5f;
         if (title.Font.Size != size) {
             foreach (var l in new[] { title, five, week }) {
@@ -367,7 +369,7 @@ internal sealed class UsageWidget : Form
     {
         if (!IsHandleCreated || Width <= 0 || Height <= 0) return;
         string signature = Width + ":" + Height + ":" + Left + ":" + Top + ":" + five.Text + ":" + week.Text + ":" + stale
-            + ":" + ResetLabel(fiveReset, false) + ":" + ResetLabel(weekReset, true);
+            + ":" + ResetLabel(fiveReset, false) + ":" + ResetLabel(weekReset, true) + ":" + WeeklyOnly;
         if (lastLayer == signature) return;
         using (var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppArgb)) {
             using (var g = Graphics.FromImage(bitmap)) {
@@ -394,15 +396,18 @@ internal sealed class UsageWidget : Form
                     DrawBrain(g);
                     g.DrawString(title.Text, headingFont, headingBrush, new PointF(31*scale, headingTop), format);
                     g.DrawLine(separator, 115*scale, Height/2f-7*scale, 115*scale, Height/2f+7*scale);
-                    g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
-                    g.DrawString("5小时", font, captionBrush, new PointF(127*scale, textTop), format);
-                    g.DrawString("每周", font, captionBrush, new PointF(232*scale, textTop), format);
-                    using (var valueBrush = new SolidBrush(AmountColor(fiveLeft, stale)))
-                        g.DrawString(Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(173*scale, textTop), format);
+                    if (!WeeklyOnly) {
+                        g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
+                        g.DrawString("5小时", font, captionBrush, new PointF(127*scale, textTop), format);
+                        using (var valueBrush = new SolidBrush(AmountColor(fiveLeft, stale)))
+                            g.DrawString(Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(173*scale, textTop), format);
+                        g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
+                    }
+                    float weekX = (WeeklyOnly ? 127 : 232) * scale;
+                    g.DrawString("每周", font, captionBrush, new PointF(weekX, textTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft, stale)))
-                        g.DrawString(Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(270*scale, textTop), format);
-                    g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
-                    g.DrawString(ResetLabel(weekReset, true), resetFont, resetBrush, new PointF(232*scale, resetTop), format);
+                        g.DrawString(Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(weekX + 38*scale, textTop), format);
+                    g.DrawString(ResetLabel(weekReset, true), resetFont, resetBrush, new PointF(weekX, resetTop), format);
                 }
             }
             IntPtr dc = GetDC(IntPtr.Zero), memory = CreateCompatibleDC(dc);
@@ -462,8 +467,9 @@ internal sealed class UsageWidget : Form
         five.Text = "5h " + Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : "");
         week.Text = "每周 " + Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
         five.ForeColor = AmountColor(fiveLeft, stale); week.ForeColor = AmountColor(weekLeft, stale);
-        string detail = "外置大脑剩余额度（每 60 秒自动刷新）\n5 小时：" + Percent(fiveLeft)
-            + "\n每周：" + Percent(weekLeft);
+        string detail = "外置大脑剩余额度（每 60 秒自动刷新）";
+        if (!WeeklyOnly) detail += "\n5 小时：" + Percent(fiveLeft);
+        detail += "\n每周：" + Percent(weekLeft);
         if (fiveReset.HasValue) detail += "\n5 小时重置：" + fiveReset.Value.ToString("MM-dd HH:mm");
         if (weekReset.HasValue) detail += "\n每周重置：" + weekReset.Value.ToString("MM-dd HH:mm");
         if (lastUpdated.HasValue) detail += "\n更新：" + lastUpdated.Value.ToString("HH:mm:ss");
@@ -477,7 +483,7 @@ internal sealed class UsageWidget : Form
     void WriteStatus()
     {
         try { File.WriteAllText(Path.Combine(store, "status.json"), json.Serialize(new {
-            fiveHourRemaining = fiveLeft, weeklyRemaining = weekLeft, stale = stale,
+            fiveHourRemaining = fiveLeft, weeklyRemaining = weekLeft, hasFiveHour = hasFive, hasWeekly = hasWeek, stale = stale,
             fiveHourReset = fiveReset.HasValue ? fiveReset.Value.ToString("o") : null,
             weeklyReset = weekReset.HasValue ? weekReset.Value.ToString("o") : null,
             fiveHourResetLabel = ResetLabel(fiveReset, false), weeklyResetLabel = ResetLabel(weekReset, true),
@@ -497,6 +503,20 @@ internal sealed class UsageWidget : Form
     static DateTime? Reset(Dictionary<string, object> window) {
         var unix = Field(window, "resetsAt");
         return unix == null ? (DateTime?)null : new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc).AddSeconds(Convert.ToDouble(unix)).ToLocalTime();
+    }
+    internal static void SelectWindows(Dictionary<string, object> limits, out Dictionary<string, object> fiveWindow, out Dictionary<string, object> weekWindow)
+    {
+        fiveWindow = null; weekWindow = null;
+        foreach (var window in new[] { Obj(Field(limits, "primary")), Obj(Field(limits, "secondary")) }) {
+            var duration = Field(window, "windowDurationMins");
+            if (duration == null) continue;
+            double minutes;
+            if (!Double.TryParse(Convert.ToString(duration, System.Globalization.CultureInfo.InvariantCulture), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out minutes)) continue;
+            if (minutes == 300 && fiveWindow == null) fiveWindow = window;
+            if (minutes == 10080 && weekWindow == null) weekWindow = window;
+        }
+        if (fiveWindow == null && weekWindow == null)
+            throw new Exception("账号未提供可识别的 5 小时或每周额度窗口。");
     }
     static string FindCodex()
     {
@@ -557,10 +577,15 @@ internal sealed class UsageWidget : Form
         try {
             var limits = await FetchUsage();
             if (IsDisposed) return;
-            var primary = Obj(Field(limits, "primary"));
-            var secondary = Obj(Field(limits, "secondary"));
-            fiveLeft = Remaining(primary); weekLeft = Remaining(secondary);
-            fiveReset = Reset(primary); weekReset = Reset(secondary);
+            Dictionary<string, object> fiveWindow, weekWindow;
+            SelectWindows(limits, out fiveWindow, out weekWindow);
+            // Complete conversion before updating the current display; a malformed response
+            // must not leave a mixture of old and new data on screen.
+            double? nextFive = Remaining(fiveWindow), nextWeek = Remaining(weekWindow);
+            DateTime? nextFiveReset = Reset(fiveWindow), nextWeekReset = Reset(weekWindow);
+            hasFive = fiveWindow != null; hasWeek = weekWindow != null;
+            fiveLeft = nextFive; weekLeft = nextWeek;
+            fiveReset = nextFiveReset; weekReset = nextWeekReset;
             lastUpdated = DateTime.Now; stale = false; error = null;
         } catch (Exception ex) { if (IsDisposed) return; stale = true; error = ex.Message; }
         finally { busy = false; }

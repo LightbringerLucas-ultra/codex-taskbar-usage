@@ -1,12 +1,18 @@
 # Codex 任务栏额度看板
 
-Windows 任务栏上的独立小组件，显示当前 Codex 账号的 5 小时和每周剩余额度及重置时间，每分钟刷新。额度来自本机 Codex `app-server` 的 `account/rateLimits/read` 接口，不执行模型任务。
+Windows 任务栏上的独立小组件，根据当前 Codex 账号返回的额度窗口显示剩余百分比及重置时间，每分钟刷新。额度来自本机 Codex `app-server` 的 `account/rateLimits/read` 接口，不执行模型任务。
 
 ## 界面预览
 
-![Codex 任务栏额度看板示意图](docs/preview.svg)
+**Plus 示例：返回 5 小时和每周两个窗口时**
 
-*示意图中的百分比和重置时间为示例，实际显示以当前账号数据及任务栏背景为准。*
+![Plus 额度看板示意图，显示 5 小时和每周剩余额度](docs/preview.svg)
+
+**Pro 示例：只返回每周窗口时**
+
+![Pro 额度看板示意图，只显示每周剩余额度](docs/preview-pro.svg)
+
+*图中百分比和重置时间均为示例。实际展示取决于接口返回的窗口，而非仅由订阅名称决定：返回两个窗口时显示两项；只返回每周窗口时显示单项。缺失的额度不会被视为无限或 100%。背景随 Windows 任务栏变化。*
 
 ## 使用条件
 
@@ -24,7 +30,7 @@ Windows 任务栏上的独立小组件，显示当前 Codex 账号的 5 小时�
 
 ## 从源码构建
 
-在 PowerShell 中运行 `./build.ps1`，输出到 `app/CodexTaskbarUsage.exe`。构建不会自动启动或安装程序。若程序正在运行，请先退出再覆盖可执行文件。源码基于 .NET Framework WinForms，无需 NuGet 依赖。
+在 PowerShell 中运行 `./build.ps1`，输出到 `app/CodexTaskbarUsage.exe`。构建不会自动启动或安装程序。若程序正在运行，请先退出再覆盖可执行文件。源码基于 .NET Framework WinForms，无需 NuGet 依赖。运行 `./test.ps1` 可验证窗口识别和额度计算。
 
 ## 数据与隐私
 
