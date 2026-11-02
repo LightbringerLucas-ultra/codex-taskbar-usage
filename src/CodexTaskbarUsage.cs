@@ -395,8 +395,25 @@ internal sealed class UsageWidget : Form
                     float baseline = titleTop + font.Size * font.FontFamily.GetCellAscent(font.Style) / font.FontFamily.GetEmHeight(font.Style);
                     float headingTop = baseline - headingFont.Size * headingFont.FontFamily.GetCellAscent(headingFont.Style) / headingFont.FontFamily.GetEmHeight(headingFont.Style);
                     DrawBrain(g);
-                    g.DrawString(title.Text, headingFont, headingBrush, new PointF(31*scale, headingTop), format);
-                    float firstSeparator = 115 * scale;
+                    float titleX = 31*scale;
+                    g.DrawString(title.Text, headingFont, headingBrush, new PointF(titleX, headingTop), format);
+                    float firstSeparator = 115*scale;
+                    float weekX = 232*scale, valueX = weekX + 38*scale, resetX = weekX;
+                    string weekValue = Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
+                    string weekResetLabel = ResetLabel(weekReset, true);
+                    if (WeeklyOnly) {
+                        // Use equal gaps from the title to each of the three weekly fields.
+                        // Recalculate when the percentage or reset label changes.
+                        float titleWidth = g.MeasureString(title.Text, headingFont, 1000, format).Width;
+                        float captionWidth = g.MeasureString("每周", weeklyCaptionFont, 1000, format).Width;
+                        float valueWidth = g.MeasureString(weekValue, font, 1000, format).Width;
+                        float resetWidth = g.MeasureString(weekResetLabel, resetFont, 1000, format).Width;
+                        float gap = Math.Max(0, (Width - 8*scale - titleX - titleWidth - captionWidth - valueWidth - resetWidth) / 3f);
+                        firstSeparator = titleX + titleWidth + gap / 2f;
+                        weekX = titleX + titleWidth + gap;
+                        valueX = weekX + captionWidth + gap;
+                        resetX = valueX + valueWidth + gap;
+                    }
                     g.DrawLine(separator, firstSeparator, Height/2f-7*scale, firstSeparator, Height/2f+7*scale);
                     if (!WeeklyOnly) {
                         g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
@@ -405,21 +422,7 @@ internal sealed class UsageWidget : Form
                             g.DrawString(Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(173*scale, textTop), format);
                         g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
                     }
-                    float weekX = (WeeklyOnly ? 127 : 232) * scale;
-                    string weekValue = Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
-                    string weekResetLabel = ResetLabel(weekReset, true);
                     float captionTop = WeeklyOnly ? (Height - weeklyCaptionFont.GetHeight(g)) / 2f : textTop;
-                    float valueX = weekX + 38*scale, resetX = weekX;
-                    if (WeeklyOnly) {
-                        // Spread the three fields evenly across the available row, including
-                        // when the percentage gains a decimal or the stale marker.
-                        float captionWidth = g.MeasureString("每周", weeklyCaptionFont, 1000, format).Width;
-                        float valueWidth = g.MeasureString(weekValue, font, 1000, format).Width;
-                        float resetWidth = g.MeasureString(weekResetLabel, resetFont, 1000, format).Width;
-                        float gap = Math.Max(0, (Width - 8*scale - weekX - captionWidth - valueWidth - resetWidth) / 2f);
-                        valueX = weekX + captionWidth + gap;
-                        resetX = valueX + valueWidth + gap;
-                    }
                     g.DrawString("每周", weeklyCaptionFont, captionBrush, new PointF(weekX, captionTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft, stale)))
                         g.DrawString(weekValue, font, valueBrush, new PointF(valueX, textTop), format);
