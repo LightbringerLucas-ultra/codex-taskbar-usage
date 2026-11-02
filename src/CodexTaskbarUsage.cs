@@ -330,7 +330,7 @@ internal sealed class UsageWidget : Form
         float nextScale = dpi / 96f;
         if (nextScale < 1) nextScale = 1;
         scale = nextScale;
-        int width = (int)((WeeklyOnly ? 221 : 316) * scale), height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
+        int width = (int)((WeeklyOnly ? 270 : 316) * scale), height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
         if (height < 20 || r.Right - r.Left < width) { HideWidget("taskbar too small"); return; }
         int x = Math.Max(r.Left + 8, Math.Min(r.Left + (int)(offset * scale), r.Right - width - 8));
         int y = r.Top + (r.Bottom - r.Top - height) / 2;
@@ -355,7 +355,7 @@ internal sealed class UsageWidget : Form
         int h = ClientSize.Height;
         title.SetBounds((int)(10*scale), 0, (int)(98*scale), h);
         five.SetBounds((int)(126*scale), 0, (int)(80*scale), h);
-        week.SetBounds((int)((WeeklyOnly ? 126 : 232)*scale), 0, (int)(80*scale), h);
+        week.SetBounds((int)((WeeklyOnly ? 146 : 232)*scale), 0, (int)((WeeklyOnly ? 116 : 80)*scale), h);
         float size = 9.5f;
         if (title.Font.Size != size) {
             foreach (var l in new[] { title, five, week }) {
@@ -377,9 +377,9 @@ internal sealed class UsageWidget : Form
                 // The real taskbar remains visible behind it, including its wallpaper tint.
                 g.Clear(Color.FromArgb(1, 0, 0, 0));
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                using (var font = new Font("Microsoft YaHei UI", 12.7f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (var resetFont = new Font("Microsoft YaHei UI", 9.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (var headingFont = new Font("华文琥珀", 13f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var font = new Font("Microsoft YaHei UI", (WeeklyOnly ? 15.5f : 12.7f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var resetFont = new Font("Microsoft YaHei UI", (WeeklyOnly ? 11.5f : 9.5f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var headingFont = new Font("华文琥珀", (WeeklyOnly ? 15.5f : 13f) * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                 using (var headingBrush = new SolidBrush(Color.FromArgb(246, 178, 196)))
                 using (var captionBrush = new SolidBrush(Color.FromArgb(187, 190, 198)))
                 using (var resetBrush = new SolidBrush(Color.FromArgb(177, 180, 188)))
@@ -395,7 +395,8 @@ internal sealed class UsageWidget : Form
                     float headingTop = baseline - headingFont.Size * headingFont.FontFamily.GetCellAscent(headingFont.Style) / headingFont.FontFamily.GetEmHeight(headingFont.Style);
                     DrawBrain(g);
                     g.DrawString(title.Text, headingFont, headingBrush, new PointF(31*scale, headingTop), format);
-                    g.DrawLine(separator, 115*scale, Height/2f-7*scale, 115*scale, Height/2f+7*scale);
+                    float firstSeparator = (WeeklyOnly ? 135 : 115) * scale;
+                    g.DrawLine(separator, firstSeparator, Height/2f-7*scale, firstSeparator, Height/2f+7*scale);
                     if (!WeeklyOnly) {
                         g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
                         g.DrawString("5小时", font, captionBrush, new PointF(127*scale, textTop), format);
@@ -403,10 +404,10 @@ internal sealed class UsageWidget : Form
                             g.DrawString(Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(173*scale, textTop), format);
                         g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
                     }
-                    float weekX = (WeeklyOnly ? 127 : 232) * scale;
+                    float weekX = (WeeklyOnly ? 147 : 232) * scale;
                     g.DrawString("每周", font, captionBrush, new PointF(weekX, textTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft, stale)))
-                        g.DrawString(Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(weekX + 38*scale, textTop), format);
+                        g.DrawString(Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(weekX + (WeeklyOnly ? 48 : 38)*scale, textTop), format);
                     g.DrawString(ResetLabel(weekReset, true), resetFont, resetBrush, new PointF(weekX, resetTop), format);
                 }
             }
