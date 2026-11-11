@@ -11,7 +11,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
-using Microsoft.Win32;
 
 internal static class Program
 {
@@ -58,7 +57,11 @@ internal static class Program
             Application.SetCompatibleTextRenderingDefault(false);
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
             Log("worker running pid=" + Process.GetCurrentProcess().Id + " job=" + JobState);
-            try { Application.Run(new UsageWidget()); }
+            try {
+                using (var widget = new UsageWidget())
+                using (var context = new ApplicationContext(widget))
+                    Application.Run(context);
+            }
             catch (Exception ex) { Log("worker exception: " + ex); Environment.ExitCode = 75; }
         }
     }
@@ -159,9 +162,6 @@ internal sealed class UsageWidget : Form
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr hwnd);
     [DllImport("user32.dll", EntryPoint="SetWindowLongPtrW", SetLastError=true)] static extern IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value);
-    delegate void WinEventCallback(IntPtr hook, uint ev, IntPtr hwnd, int objectId, int childId, uint thread, uint time);
-    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint first, uint last, IntPtr module, WinEventCallback callback, uint process, uint thread, uint flags);
-    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int size);
     [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; public POINT(int x,int y) { X=x; Y=y; } }
     [StructLayout(LayoutKind.Sequential)] struct SIZE { public int X, Y; public SIZE(int x,int y) { X=x; Y=y; } }
@@ -176,12 +176,9 @@ internal sealed class UsageWidget : Form
 
     readonly string store = Program.DataDirectory;
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
-    readonly Label title = new Label();
-    readonly Label five = new Label();
-    readonly Label week = new Label();
+    const string WidgetTitle = "外置大脑剩余";
     readonly ToolTip tip = new ToolTip();
     readonly System.Windows.Forms.Timer locationTimer = new System.Windows.Forms.Timer();
-    readonly System.Windows.Forms.Timer refreshTimer = new System.Windows.Forms.Timer();
     bool busy, stale = true, dragging;
     int offset = 152;
     int dragOrigin;
@@ -192,12 +189,11 @@ internal sealed class UsageWidget : Form
     DateTime? lastUpdated, fiveReset, weekReset;
     string error = "正在读取 Codex 用量";
     float scale = 1;
-    string lastLayer;
-    IntPtr taskbarOwner, foregroundHook, fullscreenCandidate;
-    WinEventCallback foregroundCallback;
-    DateTime fullscreenSince;
+    string lastLayer, lastStatus;
+    IntPtr taskbarOwner, fullscreenCandidate;
+    DateTime fullscreenSince, nextWindowCheck, nextRefresh;
     int hideCount;
-    bool positionQueued;
+    bool codexOpen;
     bool intentionalExit;
     string hiddenReason;
     readonly bool verifyMode = Array.IndexOf(Environment.GetCommandLineArgs(), "--verify") >= 0;
@@ -211,7 +207,7 @@ internal sealed class UsageWidget : Form
     public UsageWidget()
     {
         Directory.CreateDirectory(store);
-        Text = "外置大脑剩余";
+        Text = WidgetTitle;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = verifyMode;
         TopMost = true;
@@ -223,24 +219,11 @@ internal sealed class UsageWidget : Form
             var saved = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(store, "settings.json")));
             offset = Convert.ToInt32(saved["offset"]);
         } catch { }
-        foreach (var l in new[] { title, five, week }) {
-            l.AutoSize = false;
-            l.TextAlign = ContentAlignment.MiddleLeft;
-            l.BackColor = Color.Transparent;
-            l.MouseDown += DragDown;
-            l.MouseMove += DragMove;
-            l.MouseUp += DragUp;
-            l.DoubleClick += delegate { RefreshUsage(); };
-        }
-        title.Text = "外置大脑剩余";
-        title.ForeColor = Color.FromArgb(205, 207, 214);
-        five.Text = "5h  --";
-        week.Text = "每周  --";
         var menu = new ContextMenuStrip();
         menu.Items.Add("立即刷新", null, delegate { RefreshUsage(); });
         menu.Items.Add("恢复左侧位置", null, delegate { offset = 152; SaveSettings(); PositionWidget(); });
         menu.Items.Add(new ToolStripSeparator());
-        var startup = new ToolStripMenuItem("登录 Windows 后自动显示");
+        var startup = new ToolStripMenuItem("登录 Windows 后在后台运行");
         startup.CheckOnClick = true;
         startup.Checked = Program.StartupEnabled();
         startup.Click += delegate {
@@ -251,37 +234,67 @@ internal sealed class UsageWidget : Form
         menu.Items.Add(startup);
         menu.Items.Add("退出", null, delegate { intentionalExit = true; Program.ExitSignal.Set(); Close(); });
         ContextMenuStrip = menu;
-        foreach (var l in new[] { title, five, week }) l.ContextMenuStrip = menu;
         MouseDown += DragDown; MouseMove += DragMove; MouseUp += DragUp;
         DoubleClick += delegate { RefreshUsage(); };
         locationTimer.Interval = 250;
-        locationTimer.Tick += delegate {
-            if (Program.ExitSignal.WaitOne(0) || File.Exists(Path.Combine(store, "exit.request"))) {
-                intentionalExit = true; Program.ExitSignal.Set(); Close();
-            }
-            else PositionWidget();
-        };
-        refreshTimer.Interval = 60000;
-        refreshTimer.Tick += delegate { RefreshUsage(); };
-        Shown += delegate {
-            foregroundCallback = delegate {
-                if (IsDisposed || positionQueued) return;
-                positionQueued = true;
-                try { BeginInvoke((Action)delegate { positionQueued = false; if (!IsDisposed) PositionWidget(); }); }
-                catch { positionQueued = false; }
-            };
-            foregroundHook = SetWinEventHook(3, 3, IntPtr.Zero, foregroundCallback, 0, 0, 0);
-            PositionWidget(); locationTimer.Start(); refreshTimer.Start(); RefreshUsage();
-        };
+        locationTimer.Tick += delegate { UpdateWidget(); };
         FormClosing += delegate(object sender, FormClosingEventArgs e) {
             if (e.CloseReason == CloseReason.WindowsShutDown) intentionalExit = true;
             Program.Log("form closing reason=" + e.CloseReason + " intentional=" + intentionalExit);
         };
         FormClosed += delegate {
             Environment.ExitCode = intentionalExit || Program.ExitSignal.WaitOne(0) ? 0 : 75;
-            if (foregroundHook != IntPtr.Zero) UnhookWinEvent(foregroundHook);
-            locationTimer.Dispose(); refreshTimer.Dispose(); tip.Dispose();
+            locationTimer.Dispose(); tip.Dispose();
         };
+        // Start hidden. The timer can close this form or show it when Codex opens.
+        CreateHandle();
+        locationTimer.Start();
+    }
+
+    void UpdateWidget()
+    {
+        if (Program.ExitSignal.WaitOne(0) || File.Exists(Path.Combine(store, "exit.request"))) {
+            intentionalExit = true;
+            Program.ExitSignal.Set();
+            Close();
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        if (now >= nextWindowCheck) {
+            nextWindowCheck = now.AddSeconds(1);
+            bool wasOpen = codexOpen;
+            codexOpen = CodexWindowOpen();
+            if (codexOpen && !wasOpen) nextRefresh = now;
+        }
+        PositionWidget();
+        if (codexOpen && now >= nextRefresh) {
+            nextRefresh = now.AddMinutes(1);
+            RefreshUsage();
+        }
+    }
+
+    static bool CodexWindowOpen()
+    {
+        // The Windows desktop package currently runs as ChatGPT.exe.
+        // A main window can be minimized; background processes have no main window.
+        foreach (string name in new[] { "ChatGPT", "Codex" }) {
+            var processes = Process.GetProcessesByName(name);
+            try {
+                foreach (var process in processes) {
+                    try {
+                        if (process.MainWindowHandle == IntPtr.Zero) continue;
+                        if (name == "Codex" || process.MainModule.FileName.IndexOf(
+                            @"\WindowsApps\OpenAI.Codex_", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return true;
+                    } catch (InvalidOperationException) { }
+                      catch (System.ComponentModel.Win32Exception) { }
+                }
+            } finally {
+                foreach (var process in processes) process.Dispose();
+            }
+        }
+        return false;
     }
 
     void SaveSettings() { File.WriteAllText(Path.Combine(store, "settings.json"), json.Serialize(new { offset = offset })); }
@@ -301,6 +314,7 @@ internal sealed class UsageWidget : Form
     }
     void PositionWidget()
     {
+        if (!codexOpen) { HideWidget("codex closed"); return; }
         var taskbar = FindWindow("Shell_TrayWnd", null);
         RECT r;
         if (taskbar == IntPtr.Zero || !GetWindowRect(taskbar, out r)) { HideWidget("taskbar unavailable"); return; }
@@ -340,7 +354,6 @@ internal sealed class UsageWidget : Form
         if (Left == x && Top == y) positioningFlags |= 0x0002;
         if (Width == width && Height == height) positioningFlags |= 0x0001;
         SetWindowPos(Handle, new IntPtr(-1), x, y, width, height, positioningFlags);
-        LayoutLabels();
         DrawLayer();
         WriteStatus();
     }
@@ -350,25 +363,10 @@ internal sealed class UsageWidget : Form
         hiddenReason = reason;
         WriteStatus();
     }
-    void LayoutLabels()
-    {
-        int h = ClientSize.Height;
-        title.SetBounds((int)(10*scale), 0, (int)(98*scale), h);
-        five.SetBounds((int)(126*scale), 0, (int)(80*scale), h);
-        week.SetBounds((int)((WeeklyOnly ? 126 : 232)*scale), 0, (int)((WeeklyOnly ? 165 : 80)*scale), h);
-        float size = 9.5f;
-        if (title.Font.Size != size) {
-            foreach (var l in new[] { title, five, week }) {
-                var old = l.Font;
-                l.Font = new Font("Microsoft YaHei UI", size, FontStyle.Regular, GraphicsUnit.Point);
-                if (old != Control.DefaultFont) old.Dispose();
-            }
-        }
-    }
     void DrawLayer()
     {
         if (!IsHandleCreated || Width <= 0 || Height <= 0) return;
-        string signature = Width + ":" + Height + ":" + Left + ":" + Top + ":" + five.Text + ":" + week.Text + ":" + stale
+        string signature = Width + ":" + Height + ":" + Left + ":" + Top + ":" + fiveLeft + ":" + weekLeft + ":" + stale
             + ":" + ResetLabel(fiveReset, false) + ":" + ResetLabel(weekReset, true) + ":" + WeeklyOnly;
         if (lastLayer == signature) return;
         using (var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppArgb)) {
@@ -397,7 +395,7 @@ internal sealed class UsageWidget : Form
                     float headingTop = baseline - headingFont.Size * headingFont.FontFamily.GetCellAscent(headingFont.Style) / headingFont.FontFamily.GetEmHeight(headingFont.Style);
                     DrawBrain(g);
                     float titleX = 31*scale;
-                    g.DrawString(title.Text, headingFont, headingBrush, new PointF(titleX, headingTop), format);
+                    g.DrawString(WidgetTitle, headingFont, headingBrush, new PointF(titleX, headingTop), format);
                     float firstSeparator = 115*scale;
                     // Fixed, compact positions; the two gaps are about 11 pixels
                     // at 96 DPI when the weekly value is 100%.
@@ -410,13 +408,13 @@ internal sealed class UsageWidget : Form
                     if (!WeeklyOnly) {
                         g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
                         g.DrawString("5小时", font, captionBrush, new PointF(127*scale, textTop), format);
-                        using (var valueBrush = new SolidBrush(AmountColor(fiveLeft, stale)))
+                        using (var valueBrush = new SolidBrush(AmountColor(fiveLeft)))
                             g.DrawString(Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(173*scale, textTop), format);
                         g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
                     }
                     float captionTop = WeeklyOnly ? baseline - weeklyCaptionFont.Size * weeklyCaptionFont.FontFamily.GetCellAscent(weeklyCaptionFont.Style) / weeklyCaptionFont.FontFamily.GetEmHeight(weeklyCaptionFont.Style) : textTop;
                     g.DrawString("每周", weeklyCaptionFont, captionBrush, new PointF(weekX, captionTop), format);
-                    using (var valueBrush = new SolidBrush(AmountColor(weekLeft, stale)))
+                    using (var valueBrush = new SolidBrush(AmountColor(weekLeft)))
                         g.DrawString(weekValue, font, valueBrush, new PointF(valueX, textTop), format);
                     g.DrawString(weekResetLabel, resetFont, resetBrush, new PointF(resetX, resetTop), format);
                 }
@@ -460,7 +458,7 @@ internal sealed class UsageWidget : Form
             }
         } finally { g.Restore(saved); }
     }
-    static Color AmountColor(double? value, bool isStale) {
+    static Color AmountColor(double? value) {
         if (!value.HasValue) return Color.FromArgb(153, 156, 164);
         if (value.Value <= 100.0 / 3.0) return Color.FromArgb(255, 116, 119);
         if (value.Value <= 200.0 / 3.0) return Color.FromArgb(255, 209, 102);
@@ -475,9 +473,6 @@ internal sealed class UsageWidget : Form
     }
     void RenderUsage()
     {
-        five.Text = "5h " + Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : "");
-        week.Text = "每周 " + Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
-        five.ForeColor = AmountColor(fiveLeft, stale); week.ForeColor = AmountColor(weekLeft, stale);
         string detail = "外置大脑剩余额度（每 60 秒自动刷新）";
         if (!WeeklyOnly) detail += "\n5 小时：" + Percent(fiveLeft);
         detail += "\n每周：" + Percent(weekLeft);
@@ -486,24 +481,27 @@ internal sealed class UsageWidget : Form
         if (lastUpdated.HasValue) detail += "\n更新：" + lastUpdated.Value.ToString("HH:mm:ss");
         if (stale) detail += "\n未能更新，带 * 的数字为上次成功读取值。\n" + error;
         detail += "\n双击刷新 · 拖动调整位置 · 右键菜单";
-        foreach (var l in new[] { title, five, week }) tip.SetToolTip(l, detail);
         tip.SetToolTip(this, detail);
-        DrawLayer();
-        WriteStatus();
+        PositionWidget();
     }
     void WriteStatus()
     {
-        try { File.WriteAllText(Path.Combine(store, "status.json"), json.Serialize(new {
-            fiveHourRemaining = fiveLeft, weeklyRemaining = weekLeft, hasFiveHour = hasFive, hasWeekly = hasWeek, stale = stale,
-            fiveHourReset = fiveReset.HasValue ? fiveReset.Value.ToString("o") : null,
-            weeklyReset = weekReset.HasValue ? weekReset.Value.ToString("o") : null,
-            fiveHourResetLabel = ResetLabel(fiveReset, false), weeklyResetLabel = ResetLabel(weekReset, true),
-            updated = lastUpdated.HasValue ? lastUpdated.Value.ToString("o") : null,
-            visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale,
-            hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = taskbarOwner != IntPtr.Zero,
-            job = Program.JobState,
-            error = stale ? error : null
-        })); } catch { }
+        try {
+            string status = json.Serialize(new {
+                fiveHourRemaining = fiveLeft, weeklyRemaining = weekLeft, hasFiveHour = hasFive, hasWeekly = hasWeek, stale = stale,
+                fiveHourReset = fiveReset.HasValue ? fiveReset.Value.ToString("o") : null,
+                weeklyReset = weekReset.HasValue ? weekReset.Value.ToString("o") : null,
+                fiveHourResetLabel = ResetLabel(fiveReset, false), weeklyResetLabel = ResetLabel(weekReset, true),
+                updated = lastUpdated.HasValue ? lastUpdated.Value.ToString("o") : null,
+                codexOpen = codexOpen, visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale,
+                hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = taskbarOwner != IntPtr.Zero,
+                job = Program.JobState,
+                error = stale ? error : null
+            });
+            if (status == lastStatus) return;
+            File.WriteAllText(Path.Combine(store, "status.json"), status);
+            lastStatus = status;
+        } catch { }
     }
     static Dictionary<string, object> Obj(object o) { return o as Dictionary<string, object>; }
     static object Field(Dictionary<string, object> o, string k) { object v; return o != null && o.TryGetValue(k, out v) ? v : null; }
@@ -583,7 +581,7 @@ internal sealed class UsageWidget : Form
     }
     async void RefreshUsage()
     {
-        if (busy || IsDisposed) return;
+        if (!codexOpen || busy || IsDisposed) return;
         busy = true;
         try {
             var limits = await FetchUsage();
