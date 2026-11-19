@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.Reflection;
 
 internal static class UsageTests
@@ -37,6 +38,12 @@ internal static class UsageTests
             try { Select(Window(60, 2), Window(null, 1), out five, out week); }
             catch (Exception) { rejected = true; }
             Check(rejected, "unknown durations are not mislabeled");
+            Check(UsageWidget.ApiAmountColor(null).ToArgb() == Color.FromArgb(153, 156, 164).ToArgb(), "missing balance is gray");
+            Check(UsageWidget.ApiAmountColor(0m) == UsageWidget.ApiAmountColor(33.99m)
+                && UsageWidget.ApiAmountColor(33.99m).ToArgb() == Color.FromArgb(255, 116, 119).ToArgb(), "under 34 USD is red");
+            Check(UsageWidget.ApiAmountColor(34m) == UsageWidget.ApiAmountColor(66.99m)
+                && UsageWidget.ApiAmountColor(66.99m).ToArgb() == Color.FromArgb(255, 209, 102).ToArgb(), "34 to 66.99 USD is yellow");
+            Check(UsageWidget.ApiAmountColor(67m).ToArgb() == Color.FromArgb(125, 221, 183).ToArgb(), "67 USD and up is green");
             Console.WriteLine("PASS: " + checks + " checks"); return 0;
         } catch (Exception e) { Console.Error.WriteLine(e); return 1; }
     }

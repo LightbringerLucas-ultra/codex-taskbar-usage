@@ -6,10 +6,12 @@ using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
+using System.Windows.Automation;
 using System.Windows.Forms;
 
 internal static class Program
@@ -179,6 +181,9 @@ internal sealed class UsageWidget : Form
     const string WidgetTitle = "外置大脑剩余";
     readonly ToolTip tip = new ToolTip();
     readonly System.Windows.Forms.Timer locationTimer = new System.Windows.Forms.Timer();
+    readonly ApiCreditBalance apiCredit = new ApiCreditBalance();
+    readonly Bitmap claudeIcon = LoadIcon("Claude.png");
+    readonly Bitmap codexIcon = LoadIcon("Codex.png");
     bool busy, stale = true, dragging;
     int offset = 152;
     int dragOrigin;
@@ -191,7 +196,9 @@ internal sealed class UsageWidget : Form
     float scale = 1;
     string lastLayer, lastStatus;
     IntPtr taskbarOwner, fullscreenCandidate;
-    DateTime fullscreenSince, nextWindowCheck, nextRefresh;
+    DateTime fullscreenSince, nextWindowCheck, nextRefresh, nextCreditRefresh, nextTaskbarCheck;
+    bool creditBusy, checkingTaskbar, apiSlotVisible;
+    int? startButtonLeft;
     int hideCount;
     bool codexOpen;
     bool intentionalExit;
@@ -219,8 +226,9 @@ internal sealed class UsageWidget : Form
             var saved = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(store, "settings.json")));
             offset = Convert.ToInt32(saved["offset"]);
         } catch { }
+        apiCredit.Load(store);
         var menu = new ContextMenuStrip();
-        menu.Items.Add("立即刷新", null, delegate { RefreshUsage(); });
+        menu.Items.Add("立即刷新", null, delegate { RefreshAll(); });
         menu.Items.Add("恢复左侧位置", null, delegate { offset = 152; SaveSettings(); PositionWidget(); });
         menu.Items.Add(new ToolStripSeparator());
         var startup = new ToolStripMenuItem("登录 Windows 后在后台运行");
@@ -235,7 +243,7 @@ internal sealed class UsageWidget : Form
         menu.Items.Add("退出", null, delegate { intentionalExit = true; Program.ExitSignal.Set(); Close(); });
         ContextMenuStrip = menu;
         MouseDown += DragDown; MouseMove += DragMove; MouseUp += DragUp;
-        DoubleClick += delegate { RefreshUsage(); };
+        DoubleClick += delegate { RefreshAll(); };
         locationTimer.Interval = 250;
         locationTimer.Tick += delegate { UpdateWidget(); };
         FormClosing += delegate(object sender, FormClosingEventArgs e) {
@@ -244,7 +252,7 @@ internal sealed class UsageWidget : Form
         };
         FormClosed += delegate {
             Environment.ExitCode = intentionalExit || Program.ExitSignal.WaitOne(0) ? 0 : 75;
-            locationTimer.Dispose(); tip.Dispose();
+            locationTimer.Dispose(); tip.Dispose(); claudeIcon.Dispose(); codexIcon.Dispose();
         };
         // Start hidden. The timer can close this form or show it when Codex opens.
         CreateHandle();
@@ -265,13 +273,32 @@ internal sealed class UsageWidget : Form
             nextWindowCheck = now.AddSeconds(1);
             bool wasOpen = codexOpen;
             codexOpen = CodexWindowOpen();
-            if (codexOpen && !wasOpen) nextRefresh = now;
+            if (codexOpen && !wasOpen) nextRefresh = nextCreditRefresh = now;
         }
         PositionWidget();
         if (codexOpen && now >= nextRefresh) {
             nextRefresh = now.AddMinutes(1);
             RefreshUsage();
         }
+        if (codexOpen && now >= nextCreditRefresh) RefreshCredit();
+    }
+
+    void RefreshAll() { RefreshUsage(); RefreshCredit(); }
+
+    async void RefreshCredit()
+    {
+        if (!codexOpen || creditBusy || IsDisposed) return;
+        creditBusy = true;
+        nextCreditRefresh = DateTime.UtcNow.AddMinutes(5);
+        try {
+            decimal amount = await Task.Run(() => ApiCreditBalance.Read());
+            if (IsDisposed) return;
+            apiCredit.Update(amount, store);
+        } catch (Exception ex) {
+            if (IsDisposed) return;
+            apiCredit.MarkStale(ex.Message);
+        } finally { creditBusy = false; }
+        if (!IsDisposed) RenderUsage();
     }
 
     static bool CodexWindowOpen()
@@ -323,7 +350,10 @@ internal sealed class UsageWidget : Form
         if (taskbarOwner != taskbar) {
             SetWindowLongPtr(Handle, -8, taskbar);
             taskbarOwner = taskbar;
+            startButtonLeft = null;
+            nextTaskbarCheck = DateTime.MinValue;
         }
+        if (DateTime.UtcNow >= nextTaskbarCheck) CheckStartButton(taskbar);
         var screen = Screen.FromHandle(taskbar).Bounds;
         RECT f;
         var fg = GetForegroundWindow();
@@ -344,9 +374,12 @@ internal sealed class UsageWidget : Form
         float nextScale = dpi / 96f;
         if (nextScale < 1) nextScale = 1;
         scale = nextScale;
-        int width = (int)((WeeklyOnly ? 299 : 316) * scale), height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
-        if (height < 20 || r.Right - r.Left < width) { HideWidget("taskbar too small"); return; }
-        int x = Math.Max(r.Left + 8, Math.Min(r.Left + (int)(offset * scale), r.Right - width - 8));
+        int baseWidth = (int)((WeeklyOnly ? 299 : 332) * scale);
+        int height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
+        if (height < 20 || r.Right - r.Left < baseWidth) { HideWidget("taskbar too small"); return; }
+        int x = Math.Max(r.Left + 8, Math.Min(r.Left + (int)(offset * scale), r.Right - baseWidth - 8));
+        int right = Math.Min(r.Right - 8, startButtonLeft.GetValueOrDefault(r.Right) - (int)(9 * scale));
+        int width = Math.Max(baseWidth, Math.Min(baseWidth + (int)(98 * scale), right - x));
         int y = r.Top + (r.Bottom - r.Top - height) / 2;
         if (!Visible) { lastLayer = null; Show(); }
         hiddenReason = null;
@@ -356,6 +389,30 @@ internal sealed class UsageWidget : Form
         SetWindowPos(Handle, new IntPtr(-1), x, y, width, height, positioningFlags);
         DrawLayer();
         WriteStatus();
+    }
+    async void CheckStartButton(IntPtr taskbar)
+    {
+        if (checkingTaskbar) return;
+        checkingTaskbar = true;
+        nextTaskbarCheck = DateTime.UtcNow.AddSeconds(8);
+        try {
+            var left = await Task.Run(() => FindStartButtonLeft(taskbar));
+            if (!IsDisposed && taskbarOwner == taskbar) startButtonLeft = left;
+        } catch { }
+        finally { checkingTaskbar = false; }
+    }
+    internal static int? FindStartButtonLeft(IntPtr taskbar)
+    {
+        var root = AutomationElement.FromHandle(taskbar);
+        var condition = new OrCondition(
+            new PropertyCondition(AutomationElement.AutomationIdProperty, "StartButton"),
+            new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                new OrCondition(new PropertyCondition(AutomationElement.NameProperty, "开始"),
+                    new PropertyCondition(AutomationElement.NameProperty, "Start"))));
+        var start = root.FindFirst(TreeScope.Descendants, condition);
+        if (start == null) return null;
+        var rect = start.Current.BoundingRectangle;
+        return rect.IsEmpty || rect.Width <= 0 ? (int?)null : (int)rect.Left;
     }
     void HideWidget(string reason)
     {
@@ -367,7 +424,8 @@ internal sealed class UsageWidget : Form
     {
         if (!IsHandleCreated || Width <= 0 || Height <= 0) return;
         string signature = Width + ":" + Height + ":" + Left + ":" + Top + ":" + fiveLeft + ":" + weekLeft + ":" + stale
-            + ":" + ResetLabel(fiveReset, false) + ":" + ResetLabel(weekReset, true) + ":" + WeeklyOnly;
+            + ":" + ResetLabel(fiveReset, false) + ":" + ResetLabel(weekReset, true) + ":" + WeeklyOnly
+            + ":" + apiCredit.Display + ":" + apiCredit.Stale + ":" + startButtonLeft;
         if (lastLayer == signature) return;
         using (var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppArgb)) {
             using (var g = Graphics.FromImage(bitmap)) {
@@ -397,13 +455,25 @@ internal sealed class UsageWidget : Form
                     float titleX = 31*scale;
                     g.DrawString(WidgetTitle, headingFont, headingBrush, new PointF(titleX, headingTop), format);
                     float firstSeparator = 115*scale;
-                    // Fixed, compact positions; the two gaps are about 11 pixels
-                    // at 96 DPI when the weekly value is 100%.
-                    float weekX = (WeeklyOnly ? 127 : 232)*scale;
-                    float valueX = (WeeklyOnly ? 161 : 270)*scale;
-                    float resetX = (WeeklyOnly ? 206.5f : 232)*scale;
                     string weekValue = Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
                     string weekResetLabel = ResetLabel(weekReset, true);
+                    float iconSize = 15 * scale;
+                    float codexX = (WeeklyOnly ? 123 : 228) * scale;
+                    float weekX = codexX + iconSize + 7 * scale;
+                    float valueX = weekX + g.MeasureString("每周", weeklyCaptionFont, int.MaxValue, format).Width + 10 * scale;
+                    float valueRight = valueX + g.MeasureString(weekValue, font, int.MaxValue, format).Width;
+                    float resetX = WeeklyOnly ? Math.Max(216 * scale, valueRight + 8 * scale) : weekX;
+                    float amountWidth = g.MeasureString(apiCredit.Display, font, int.MaxValue, format).Width;
+                    float apiWidth = iconSize + 6 * scale + amountWidth;
+                    float apiX = Math.Min((WeeklyOnly ? 321 : 338) * scale, Width - 6 * scale - apiWidth);
+                    float resetWidth = g.MeasureString(weekResetLabel, resetFont, int.MaxValue, format).Width;
+                    if (WeeklyOnly) {
+                        float minResetX = valueRight + 8 * scale;
+                        float compactResetX = apiX - resetWidth - 10 * scale;
+                        if (compactResetX >= minResetX) resetX = Math.Min(resetX, compactResetX);
+                    }
+                    float mainRight = Math.Max(resetX + resetWidth, valueRight);
+                    apiSlotVisible = apiX >= mainRight + 9 * scale;
                     g.DrawLine(separator, firstSeparator, Height/2f-7*scale, firstSeparator, Height/2f+7*scale);
                     if (!WeeklyOnly) {
                         g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
@@ -413,10 +483,18 @@ internal sealed class UsageWidget : Form
                         g.DrawString(ResetLabel(fiveReset, false), resetFont, resetBrush, new PointF(127*scale, resetTop), format);
                     }
                     float captionTop = WeeklyOnly ? baseline - weeklyCaptionFont.Size * weeklyCaptionFont.FontFamily.GetCellAscent(weeklyCaptionFont.Style) / weeklyCaptionFont.FontFamily.GetEmHeight(weeklyCaptionFont.Style) : textTop;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    float codexMidY = WeeklyOnly ? Height / 2f : textTop + font.GetHeight(g) / 2f;
+                    DrawIcon(g, codexIcon, codexX, codexMidY, iconSize);
                     g.DrawString("每周", weeklyCaptionFont, captionBrush, new PointF(weekX, captionTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft)))
                         g.DrawString(weekValue, font, valueBrush, new PointF(valueX, textTop), format);
                     g.DrawString(weekResetLabel, resetFont, resetBrush, new PointF(resetX, resetTop), format);
+                    if (apiSlotVisible) {
+                        DrawIcon(g, claudeIcon, apiX, Height / 2f, iconSize);
+                        using (var apiBrush = new SolidBrush(ApiAmountColor(apiCredit.Amount)))
+                            g.DrawString(apiCredit.Display, font, apiBrush, new PointF(apiX + iconSize + 6 * scale, titleTop), format);
+                    }
                 }
             }
             IntPtr dc = GetDC(IntPtr.Zero), memory = CreateCompatibleDC(dc);
@@ -427,6 +505,28 @@ internal sealed class UsageWidget : Form
                 if (UpdateLayeredWindow(Handle, dc, ref position, ref size, memory, ref origin, 0, ref blend, 2)) lastLayer = signature;
             } finally { SelectObject(memory, previous); DeleteObject(dib); DeleteDC(memory); ReleaseDC(IntPtr.Zero, dc); }
         }
+    }
+    static Bitmap LoadIcon(string resourceName)
+    {
+        using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName))
+        using (var icon = new Bitmap(stream)) {
+            int left = icon.Width, right = -1, top = icon.Height, bottom = -1;
+            for (int y = 0; y < icon.Height; y++) {
+                for (int x = 0; x < icon.Width; x++) {
+                    if (icon.GetPixel(x, y).A < 16) continue;
+                    left = Math.Min(left, x); right = Math.Max(right, x);
+                    top = Math.Min(top, y); bottom = Math.Max(bottom, y);
+                }
+            }
+            if (right < left) return new Bitmap(icon);
+            return icon.Clone(Rectangle.FromLTRB(left, top, right + 1, bottom + 1), PixelFormat.Format32bppArgb);
+        }
+    }
+    static void DrawIcon(Graphics g, Bitmap icon, float left, float centerY, float size)
+    {
+        float ratio = size / Math.Max(icon.Width, icon.Height);
+        float width = icon.Width * ratio, height = icon.Height * ratio;
+        g.DrawImage(icon, new RectangleF(left + (size - width) / 2f, centerY - height / 2f, width, height));
     }
     void DrawBrain(Graphics g)
     {
@@ -458,11 +558,22 @@ internal sealed class UsageWidget : Form
             }
         } finally { g.Restore(saved); }
     }
+    static readonly Color NoAmount = Color.FromArgb(153, 156, 164);
+    static readonly Color LowAmount = Color.FromArgb(255, 116, 119);
+    static readonly Color MediumAmount = Color.FromArgb(255, 209, 102);
+    static readonly Color HighAmount = Color.FromArgb(125, 221, 183);
+
     static Color AmountColor(double? value) {
-        if (!value.HasValue) return Color.FromArgb(153, 156, 164);
-        if (value.Value <= 100.0 / 3.0) return Color.FromArgb(255, 116, 119);
-        if (value.Value <= 200.0 / 3.0) return Color.FromArgb(255, 209, 102);
-        return Color.FromArgb(125, 221, 183);
+        if (!value.HasValue) return NoAmount;
+        if (value.Value <= 100.0 / 3.0) return LowAmount;
+        if (value.Value <= 200.0 / 3.0) return MediumAmount;
+        return HighAmount;
+    }
+    internal static Color ApiAmountColor(decimal? amount) {
+        if (!amount.HasValue) return NoAmount;
+        if (amount.Value < 34m) return LowAmount;
+        if (amount.Value < 67m) return MediumAmount;
+        return HighAmount;
     }
     static string Percent(double? v) { return v.HasValue ? v.Value.ToString("0.#") + "%" : "--"; }
     static string ResetLabel(DateTime? reset, bool weekly)
@@ -480,6 +591,10 @@ internal sealed class UsageWidget : Form
         if (weekReset.HasValue) detail += "\n每周重置：" + weekReset.Value.ToString("MM-dd HH:mm");
         if (lastUpdated.HasValue) detail += "\n更新：" + lastUpdated.Value.ToString("HH:mm:ss");
         if (stale) detail += "\n未能更新，带 * 的数字为上次成功读取值。\n" + error;
+        detail += "\nOpenAI API 余额：" + apiCredit.Display;
+        if (apiCredit.LastRead.HasValue) detail += " · " + apiCredit.LastRead.Value.ToLocalTime().ToString("MM-dd HH:mm:ss");
+        if (apiCredit.Stale) detail += "\n" + apiCredit.Note;
+        else detail += "\n来自 OpenAI Platform，每 5 分钟更新";
         detail += "\n双击刷新 · 拖动调整位置 · 右键菜单";
         tip.SetToolTip(this, detail);
         PositionWidget();
@@ -493,6 +608,8 @@ internal sealed class UsageWidget : Form
                 weeklyReset = weekReset.HasValue ? weekReset.Value.ToString("o") : null,
                 fiveHourResetLabel = ResetLabel(fiveReset, false), weeklyResetLabel = ResetLabel(weekReset, true),
                 updated = lastUpdated.HasValue ? lastUpdated.Value.ToString("o") : null,
+                apiCredit = apiCredit.Display, apiCreditUpdated = apiCredit.LastRead, apiCreditStale = apiCredit.Stale,
+                apiSlotVisible = apiSlotVisible, startButtonLeft = startButtonLeft,
                 codexOpen = codexOpen, visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale,
                 hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = taskbarOwner != IntPtr.Zero,
                 job = Program.JobState,
