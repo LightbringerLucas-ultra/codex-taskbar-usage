@@ -199,6 +199,7 @@ internal sealed class UsageWidget : Form
     DateTime fullscreenSince, nextWindowCheck, nextRefresh, nextCreditRefresh, nextTaskbarCheck;
     bool creditBusy, checkingTaskbar, apiSlotVisible;
     int? startButtonLeft;
+    int requiredBalanceWidth;
     int hideCount;
     bool codexOpen;
     bool intentionalExit;
@@ -289,14 +290,15 @@ internal sealed class UsageWidget : Form
     {
         if (!codexOpen || creditBusy || IsDisposed) return;
         creditBusy = true;
-        nextCreditRefresh = DateTime.UtcNow.AddMinutes(5);
         try {
             decimal amount = await Task.Run(() => ApiCreditBalance.Read());
             if (IsDisposed) return;
             apiCredit.Update(amount, store);
+            nextCreditRefresh = DateTime.UtcNow.AddMinutes(5);
         } catch (Exception ex) {
             if (IsDisposed) return;
             apiCredit.MarkStale(ex.Message);
+            nextCreditRefresh = DateTime.UtcNow.AddSeconds(30);
         } finally { creditBusy = false; }
         if (!IsDisposed) RenderUsage();
     }
@@ -377,9 +379,14 @@ internal sealed class UsageWidget : Form
         int baseWidth = (int)((WeeklyOnly ? 299 : 332) * scale);
         int height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
         if (height < 20 || r.Right - r.Left < baseWidth) { HideWidget("taskbar too small"); return; }
-        int x = Math.Max(r.Left + 8, Math.Min(r.Left + (int)(offset * scale), r.Right - baseWidth - 8));
+        int left = r.Left + 8;
+        int x = Math.Max(left, Math.Min(r.Left + (int)(offset * scale), r.Right - baseWidth - 8));
         int right = Math.Min(r.Right - 8, startButtonLeft.GetValueOrDefault(r.Right) - (int)(9 * scale));
-        int width = Math.Max(baseWidth, Math.Min(baseWidth + (int)(98 * scale), right - x));
+        // With less space before Start, keep both readouts by moving the row only as far as needed.
+        if (right - x < requiredBalanceWidth && right - left >= requiredBalanceWidth)
+            x = right - requiredBalanceWidth;
+        int preferredWidth = Math.Max(baseWidth + (int)(98 * scale), requiredBalanceWidth);
+        int width = Math.Max(baseWidth, Math.Min(preferredWidth, right - x));
         int y = r.Top + (r.Bottom - r.Top - height) / 2;
         if (!Visible) { lastLayer = null; Show(); }
         hiddenReason = null;
@@ -463,18 +470,21 @@ internal sealed class UsageWidget : Form
                     float weekX = codexX + iconSize + 7 * scale;
                     float valueX = weekX + g.MeasureString("每周", weeklyCaptionFont, int.MaxValue, format).Width + 10 * scale;
                     float valueRight = valueX + g.MeasureString(weekValue, font, int.MaxValue, format).Width;
-                    float resetX = WeeklyOnly ? Math.Max(216 * scale, valueRight + 8 * scale) : weekX;
+                    float minResetX = WeeklyOnly ? valueRight + 8 * scale : weekX;
                     float amountWidth = g.MeasureString(apiCredit.Display, font, int.MaxValue, format).Width;
                     float apiWidth = iconSize + 6 * scale + amountWidth;
-                    float apiX = Math.Min((WeeklyOnly ? 321 : 338) * scale, Width - 6 * scale - apiWidth);
                     float resetWidth = g.MeasureString(weekResetLabel, resetFont, int.MaxValue, format).Width;
-                    if (WeeklyOnly) {
-                        float minResetX = valueRight + 8 * scale;
-                        float compactResetX = apiX - resetWidth - 10 * scale;
-                        if (compactResetX >= minResetX) resetX = Math.Min(resetX, compactResetX);
-                    }
+                    float groupGap = 10 * scale;
+                    float minimumApiX = Math.Max(minResetX + resetWidth, valueRight) + groupGap;
+                    float rightPadding = 6 * scale;
+                    requiredBalanceWidth = (int)Math.Ceiling(minimumApiX + apiWidth + rightPadding) + 1;
+                    float idealApiX = Math.Max((WeeklyOnly ? 321 : 338) * scale, minimumApiX);
+                    float apiX = Math.Min(idealApiX, Width - rightPadding - apiWidth);
+                    float resetX = WeeklyOnly
+                        ? Math.Max(minResetX, Math.Min(216 * scale, apiX - resetWidth - groupGap))
+                        : weekX;
                     float mainRight = Math.Max(resetX + resetWidth, valueRight);
-                    apiSlotVisible = apiX >= mainRight + 9 * scale;
+                    apiSlotVisible = apiX + 0.01f >= mainRight + groupGap;
                     g.DrawLine(separator, firstSeparator, Height/2f-7*scale, firstSeparator, Height/2f+7*scale);
                     if (!WeeklyOnly) {
                         g.DrawLine(separator, secondSeparator, Height/2f-7*scale, secondSeparator, Height/2f+7*scale);
@@ -609,7 +619,8 @@ internal sealed class UsageWidget : Form
                 fiveHourResetLabel = ResetLabel(fiveReset, false), weeklyResetLabel = ResetLabel(weekReset, true),
                 updated = lastUpdated.HasValue ? lastUpdated.Value.ToString("o") : null,
                 apiCredit = apiCredit.Display, apiCreditUpdated = apiCredit.LastRead, apiCreditStale = apiCredit.Stale,
-                apiSlotVisible = apiSlotVisible, startButtonLeft = startButtonLeft,
+                apiSlotVisible = apiSlotVisible, requiredBalanceWidth = requiredBalanceWidth, startButtonLeft = startButtonLeft,
+                apiCreditError = apiCredit.Stale ? apiCredit.Note : null,
                 codexOpen = codexOpen, visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale,
                 hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = taskbarOwner != IntPtr.Zero,
                 job = Program.JobState,

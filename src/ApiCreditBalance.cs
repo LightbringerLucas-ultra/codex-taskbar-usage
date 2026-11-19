@@ -89,13 +89,18 @@ internal sealed class ApiCreditBalance
             Run("open " + Platform, profileArgument, 16000);
             opened = true;
             Run("wait text \"Credit remaining\" --timeout 12000", profileArgument, 16000);
-            string result = Run("eval \"" + ExtractBalance.Replace("\r", "").Replace("\n", " ") + "\"", profileArgument, 10000) as string;
-            decimal balance;
-            if (result == null || !Regex.IsMatch(result, @"^(?:US)?\$\s*[−-]?[0-9][0-9,]*\.[0-9]{2}$")
-                || !Decimal.TryParse(result.Replace("US", "").Replace("$", "").Replace("−", "-").Trim(),
-                    NumberStyles.Number, CultureInfo.InvariantCulture, out balance))
-                throw new InvalidOperationException("OpenAI Platform 未显示可读取的美元余额。");
-            return balance;
+            // The title can render before the monetary value. Recheck the same page without reloading it.
+            string readAmount = "eval \"" + ExtractBalance.Replace("\r", "").Replace("\n", " ") + "\"";
+            for (int attempt = 0; attempt < 4; attempt++) {
+                if (attempt > 0) Thread.Sleep(650);
+                string result = Run(readAmount, profileArgument, 10000) as string;
+                decimal balance;
+                if (result != null && Regex.IsMatch(result, @"^(?:US)?\$\s*[−-]?[0-9][0-9,]*\.[0-9]{2}$")
+                    && Decimal.TryParse(result.Replace("US", "").Replace("$", "").Replace("−", "-").Trim(),
+                        NumberStyles.Number, CultureInfo.InvariantCulture, out balance))
+                    return balance;
+            }
+            throw new InvalidOperationException("OpenAI Platform 未显示可读取的美元余额。");
         } finally {
             if (opened) try { Run("close", profileArgument, 5000); } catch { }
         }
@@ -157,7 +162,7 @@ internal sealed class ApiCreditBalance
             Task<string> pending = process.StandardOutput.ReadToEndAsync();
             if (!process.WaitForExit(timeout) || !pending.Wait(1000)) {
                 try { if (!process.HasExited) process.Kill(); } catch (InvalidOperationException) { }
-                throw new InvalidOperationException("读取 OpenAI Platform 余额超时。");
+                throw new InvalidOperationException("OpenAI Platform 余额查询超时，请稍后重试。");
             }
             if (process.ExitCode != 0)
                 throw new InvalidOperationException("请确认 Edge 已登录 OpenAI Platform，且 OpenCLI 浏览器连接可用。");
