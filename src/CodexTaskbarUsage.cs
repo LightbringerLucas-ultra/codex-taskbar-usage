@@ -454,11 +454,12 @@ internal sealed class UsageWidget : Form
                     DrawBrain(g);
                     float titleX = 31*scale;
                     g.DrawString(WidgetTitle, headingFont, headingBrush, new PointF(titleX, headingTop), format);
-                    float firstSeparator = 115*scale;
+                    float firstSeparator = 115 * scale, secondSeparator = 220 * scale;
                     string weekValue = Percent(weekLeft) + (stale && weekLeft.HasValue ? "*" : "");
                     string weekResetLabel = ResetLabel(weekReset, true);
                     float iconSize = 15 * scale;
-                    float codexX = (WeeklyOnly ? 123 : 228) * scale;
+                    float iconCenterY = Height / 2f;
+                    float codexX = (WeeklyOnly ? firstSeparator : secondSeparator) + 14 * scale;
                     float weekX = codexX + iconSize + 7 * scale;
                     float valueX = weekX + g.MeasureString("每周", weeklyCaptionFont, int.MaxValue, format).Width + 10 * scale;
                     float valueRight = valueX + g.MeasureString(weekValue, font, int.MaxValue, format).Width;
@@ -476,7 +477,7 @@ internal sealed class UsageWidget : Form
                     apiSlotVisible = apiX >= mainRight + 9 * scale;
                     g.DrawLine(separator, firstSeparator, Height/2f-7*scale, firstSeparator, Height/2f+7*scale);
                     if (!WeeklyOnly) {
-                        g.DrawLine(separator, 220*scale, Height/2f-7*scale, 220*scale, Height/2f+7*scale);
+                        g.DrawLine(separator, secondSeparator, Height/2f-7*scale, secondSeparator, Height/2f+7*scale);
                         g.DrawString("5小时", font, captionBrush, new PointF(127*scale, textTop), format);
                         using (var valueBrush = new SolidBrush(AmountColor(fiveLeft)))
                             g.DrawString(Percent(fiveLeft) + (stale && fiveLeft.HasValue ? "*" : ""), font, valueBrush, new PointF(173*scale, textTop), format);
@@ -484,14 +485,13 @@ internal sealed class UsageWidget : Form
                     }
                     float captionTop = WeeklyOnly ? baseline - weeklyCaptionFont.Size * weeklyCaptionFont.FontFamily.GetCellAscent(weeklyCaptionFont.Style) / weeklyCaptionFont.FontFamily.GetEmHeight(weeklyCaptionFont.Style) : textTop;
                     g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    float codexMidY = WeeklyOnly ? Height / 2f : textTop + font.GetHeight(g) / 2f;
-                    DrawIcon(g, codexIcon, codexX, codexMidY, iconSize);
+                    DrawIcon(g, codexIcon, codexX, iconCenterY, iconSize);
                     g.DrawString("每周", weeklyCaptionFont, captionBrush, new PointF(weekX, captionTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft)))
                         g.DrawString(weekValue, font, valueBrush, new PointF(valueX, textTop), format);
                     g.DrawString(weekResetLabel, resetFont, resetBrush, new PointF(resetX, resetTop), format);
                     if (apiSlotVisible) {
-                        DrawIcon(g, claudeIcon, apiX, Height / 2f, iconSize);
+                        DrawIcon(g, claudeIcon, apiX, iconCenterY, iconSize);
                         using (var apiBrush = new SolidBrush(ApiAmountColor(apiCredit.Amount)))
                             g.DrawString(apiCredit.Display, font, apiBrush, new PointF(apiX + iconSize + 6 * scale, titleTop), format);
                     }
