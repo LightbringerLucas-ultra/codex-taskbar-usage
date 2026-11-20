@@ -542,7 +542,8 @@ internal sealed class UsageWidget : Form
                     float valueRight = valueX + g.MeasureString(weekValue, font, int.MaxValue, format).Width;
                     float minResetX = WeeklyOnly ? valueRight + 8 * scale : weekX;
                     float amountWidth = g.MeasureString(apiCredit.Display, font, int.MaxValue, format).Width;
-                    float apiWidth = iconSize + 6 * scale + amountWidth + (claudeCodeOpen ? 0 : 6 * scale);
+                    float starWidth = claudeCodeOpen ? 0 : scale + g.MeasureString("*", font, int.MaxValue, format).Width;
+                    float apiWidth = iconSize + 6 * scale + amountWidth + starWidth;
                     float resetWidth = g.MeasureString(weekResetLabel, resetFont, int.MaxValue, format).Width;
                     float groupGap = 10 * scale;
                     float minimumApiX = Math.Max(minResetX + resetWidth, valueRight) + groupGap;
@@ -575,10 +576,8 @@ internal sealed class UsageWidget : Form
                         float amountX = apiX + iconSize + 6 * scale;
                         using (var apiBrush = new SolidBrush(ApiAmountColor(apiCredit.Amount))) {
                             g.DrawString(apiCredit.Display, font, apiBrush, new PointF(amountX, titleTop), format);
-                            if (!claudeCodeOpen) {
-                                using (var starFont = new Font(font.FontFamily, 8 * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                                    g.DrawString("*", starFont, apiBrush, new PointF(amountX + amountWidth + scale, titleTop - 2 * scale), format);
-                            }
+                            if (!claudeCodeOpen)
+                                g.DrawString("*", font, apiBrush, new PointF(amountX + amountWidth + scale, titleTop - 2 * scale), format);
                         }
                     }
                 }
