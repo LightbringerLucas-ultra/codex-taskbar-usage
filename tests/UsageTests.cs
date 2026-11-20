@@ -44,6 +44,9 @@ internal static class UsageTests
             Check(UsageWidget.ApiAmountColor(34m) == UsageWidget.ApiAmountColor(66.99m)
                 && UsageWidget.ApiAmountColor(66.99m).ToArgb() == Color.FromArgb(255, 209, 102).ToArgb(), "34 to 66.99 USD is yellow");
             Check(UsageWidget.ApiAmountColor(67m).ToArgb() == Color.FromArgb(125, 221, 183).ToArgb(), "67 USD and up is green");
+            Check(UsageWidget.IsClaudeCodeExecutable(@"C:\Users\Demo\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe"), "npm Claude Code native launcher");
+            Check(UsageWidget.IsClaudeCodeExecutable(@"C:\Users\Demo\.local\bin\claude.exe"), "standalone Claude Code installer");
+            Check(!UsageWidget.IsClaudeCodeExecutable(@"C:\Program Files\WindowsApps\Claude_1.0.0_x64\app\claude.exe"), "Claude Desktop does not start API polling");
             Console.WriteLine("PASS: " + checks + " checks"); return 0;
         } catch (Exception e) { Console.Error.WriteLine(e); return 1; }
     }

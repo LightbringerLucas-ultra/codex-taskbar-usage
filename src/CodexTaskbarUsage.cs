@@ -196,12 +196,13 @@ internal sealed class UsageWidget : Form
     float scale = 1;
     string lastLayer, lastStatus;
     IntPtr taskbarOwner, fullscreenCandidate;
-    DateTime fullscreenSince, nextWindowCheck, nextRefresh, nextCreditRefresh, nextTaskbarCheck;
-    bool creditBusy, checkingTaskbar, apiSlotVisible;
+    DateTime fullscreenSince, nextWindowCheck, nextRefresh, nextCreditRefresh, nextTaskbarCheck, nextLayerRefresh;
+    bool checkingTaskbar, checkingApps, apiSlotVisible;
+    CancellationTokenSource creditRequest;
     int? startButtonLeft;
     int requiredBalanceWidth;
     int hideCount;
-    bool codexOpen;
+    bool codexOpen, claudeCodeOpen;
     bool intentionalExit;
     string hiddenReason;
     readonly bool verifyMode = Array.IndexOf(Environment.GetCommandLineArgs(), "--verify") >= 0;
@@ -249,6 +250,13 @@ internal sealed class UsageWidget : Form
         locationTimer.Tick += delegate { UpdateWidget(); };
         FormClosing += delegate(object sender, FormClosingEventArgs e) {
             if (e.CloseReason == CloseReason.WindowsShutDown) intentionalExit = true;
+            if (creditRequest != null) {
+                creditRequest.Cancel();
+                if (intentionalExit && e.CloseReason != CloseReason.WindowsShutDown) {
+                    e.Cancel = true;
+                    return; // Let the query close its browser session before exiting.
+                }
+            }
             Program.Log("form closing reason=" + e.CloseReason + " intentional=" + intentionalExit);
         };
         FormClosed += delegate {
@@ -270,36 +278,60 @@ internal sealed class UsageWidget : Form
         }
 
         var now = DateTime.UtcNow;
-        if (now >= nextWindowCheck) {
+        if (!checkingApps && now >= nextWindowCheck) {
             nextWindowCheck = now.AddSeconds(1);
-            bool wasOpen = codexOpen;
-            codexOpen = CodexWindowOpen();
-            if (codexOpen && !wasOpen) nextRefresh = nextCreditRefresh = now;
+            CheckRunningApps();
         }
         PositionWidget();
         if (codexOpen && now >= nextRefresh) {
             nextRefresh = now.AddMinutes(1);
             RefreshUsage();
         }
-        if (codexOpen && now >= nextCreditRefresh) RefreshCredit();
+        if (claudeCodeOpen && now >= nextCreditRefresh) RefreshCredit();
+    }
+
+    async void CheckRunningApps()
+    {
+        checkingApps = true;
+        try {
+            // Reading a process's window or executable can stall during app startup or exit.
+            bool[] running = await Task.Run(() => new[] { CodexWindowOpen(), ClaudeCodeOpen() });
+            if (IsDisposed) return;
+            bool wasOpen = codexOpen;
+            codexOpen = running[0];
+            if (codexOpen && !wasOpen) nextRefresh = DateTime.UtcNow;
+            bool claudeWasOpen = claudeCodeOpen;
+            claudeCodeOpen = running[1];
+            if (claudeCodeOpen != claudeWasOpen) {
+                nextCreditRefresh = claudeCodeOpen ? DateTime.UtcNow : DateTime.MaxValue;
+                if (!claudeCodeOpen && creditRequest != null) creditRequest.Cancel();
+                RenderUsage();
+            }
+        } catch (System.ComponentModel.Win32Exception) { }
+        finally { checkingApps = false; }
     }
 
     void RefreshAll() { RefreshUsage(); RefreshCredit(); }
 
     async void RefreshCredit()
     {
-        if (!codexOpen || creditBusy || IsDisposed) return;
-        creditBusy = true;
+        if (!claudeCodeOpen || creditRequest != null || IsDisposed) return;
+        var request = new CancellationTokenSource();
+        creditRequest = request;
+        nextCreditRefresh = DateTime.UtcNow.AddMinutes(5);
         try {
-            decimal amount = await Task.Run(() => ApiCreditBalance.Read());
-            if (IsDisposed) return;
+            decimal amount = await Task.Run(() => ApiCreditBalance.Read(request.Token));
+            if (IsDisposed || !claudeCodeOpen || request.IsCancellationRequested) return;
             apiCredit.Update(amount, store);
-            nextCreditRefresh = DateTime.UtcNow.AddMinutes(5);
+        } catch (OperationCanceledException) {
+            // No refresh result can replace the saved value after Claude Code closes.
         } catch (Exception ex) {
-            if (IsDisposed) return;
+            if (IsDisposed || request.IsCancellationRequested) return;
             apiCredit.MarkStale(ex.Message);
-            nextCreditRefresh = DateTime.UtcNow.AddSeconds(30);
-        } finally { creditBusy = false; }
+        } finally {
+            creditRequest = null;
+            request.Dispose();
+        }
         if (!IsDisposed) RenderUsage();
     }
 
@@ -326,6 +358,40 @@ internal sealed class UsageWidget : Form
         return false;
     }
 
+    static readonly int DesktopSession = CurrentSessionId();
+    static int CurrentSessionId() { using (var process = Process.GetCurrentProcess()) return process.SessionId; }
+
+    static bool ClaudeCodeOpen()
+    {
+        foreach (string name in new[] { "claude", "claude-code" }) {
+            var processes = Process.GetProcessesByName(name);
+            try {
+                foreach (var process in processes) {
+                    try {
+                        if (process.SessionId == DesktopSession && IsClaudeCodeExecutable(process.MainModule.FileName))
+                            return true;
+                    } catch (InvalidOperationException) { }
+                      catch (System.ComponentModel.Win32Exception) { }
+                }
+            } finally { foreach (var process in processes) process.Dispose(); }
+        }
+        return false;
+    }
+
+    internal static bool IsClaudeCodeExecutable(string path)
+    {
+        string normalized = path.Replace('/', '\\').ToLowerInvariant();
+        if (normalized.EndsWith(@"\claude-code.exe", StringComparison.Ordinal)) return true;
+        if (!normalized.EndsWith(@"\claude.exe", StringComparison.Ordinal)) return false;
+        return normalized.Contains(@"\@anthropic-ai\claude-code\")
+            || normalized.Contains(@"\@anthropic-ai\claude-code-win32-")
+            || normalized.Contains(@"\.local\bin\")
+            || normalized.Contains(@"\.local\share\claude\")
+            || normalized.Contains(@"\winget\packages\anthropic.claudecode_")
+            || normalized.Contains(@"\scoop\apps\claude-code\")
+            || normalized.Contains(@"\.bun\bin\");
+    }
+
     void SaveSettings() { File.WriteAllText(Path.Combine(store, "settings.json"), json.Serialize(new { offset = offset })); }
     void DragDown(object sender, MouseEventArgs e) {
         if (e.Button != MouseButtons.Left) return;
@@ -343,7 +409,7 @@ internal sealed class UsageWidget : Form
     }
     void PositionWidget()
     {
-        if (!codexOpen) { HideWidget("codex closed"); return; }
+        if (!codexOpen && !claudeCodeOpen) { HideWidget("Codex and Claude Code closed"); return; }
         var taskbar = FindWindow("Shell_TrayWnd", null);
         RECT r;
         if (taskbar == IntPtr.Zero || !GetWindowRect(taskbar, out r)) { HideWidget("taskbar unavailable"); return; }
@@ -352,6 +418,7 @@ internal sealed class UsageWidget : Form
         if (taskbarOwner != taskbar) {
             SetWindowLongPtr(Handle, -8, taskbar);
             taskbarOwner = taskbar;
+            lastLayer = null;
             startButtonLeft = null;
             nextTaskbarCheck = DateTime.MinValue;
         }
@@ -389,8 +456,10 @@ internal sealed class UsageWidget : Form
         int width = Math.Max(baseWidth, Math.Min(preferredWidth, right - x));
         int y = r.Top + (r.Bottom - r.Top - height) / 2;
         if (!Visible) { lastLayer = null; Show(); }
+        if (hiddenReason != null) Program.Log("taskbar widget restored after " + hiddenReason);
         hiddenReason = null;
         uint positioningFlags = 0x0010;
+        if (!IsWindowVisible(Handle)) { lastLayer = null; positioningFlags |= 0x0040; }
         if (Left == x && Top == y) positioningFlags |= 0x0002;
         if (Width == width && Height == height) positioningFlags |= 0x0001;
         SetWindowPos(Handle, new IntPtr(-1), x, y, width, height, positioningFlags);
@@ -424,6 +493,7 @@ internal sealed class UsageWidget : Form
     void HideWidget(string reason)
     {
         if (Visible) { Hide(); hideCount++; lastLayer = null; }
+        if (hiddenReason != reason) Program.Log("taskbar widget hidden: " + reason);
         hiddenReason = reason;
         WriteStatus();
     }
@@ -432,8 +502,8 @@ internal sealed class UsageWidget : Form
         if (!IsHandleCreated || Width <= 0 || Height <= 0) return;
         string signature = Width + ":" + Height + ":" + Left + ":" + Top + ":" + fiveLeft + ":" + weekLeft + ":" + stale
             + ":" + ResetLabel(fiveReset, false) + ":" + ResetLabel(weekReset, true) + ":" + WeeklyOnly
-            + ":" + apiCredit.Display + ":" + apiCredit.Stale + ":" + startButtonLeft;
-        if (lastLayer == signature) return;
+            + ":" + apiCredit.Display + ":" + !claudeCodeOpen + ":" + startButtonLeft;
+        if (lastLayer == signature && DateTime.UtcNow < nextLayerRefresh) return;
         using (var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppArgb)) {
             using (var g = Graphics.FromImage(bitmap)) {
                 // An almost invisible alpha gives the entire row a usable mouse target.
@@ -472,7 +542,7 @@ internal sealed class UsageWidget : Form
                     float valueRight = valueX + g.MeasureString(weekValue, font, int.MaxValue, format).Width;
                     float minResetX = WeeklyOnly ? valueRight + 8 * scale : weekX;
                     float amountWidth = g.MeasureString(apiCredit.Display, font, int.MaxValue, format).Width;
-                    float apiWidth = iconSize + 6 * scale + amountWidth;
+                    float apiWidth = iconSize + 6 * scale + amountWidth + (claudeCodeOpen ? 0 : 6 * scale);
                     float resetWidth = g.MeasureString(weekResetLabel, resetFont, int.MaxValue, format).Width;
                     float groupGap = 10 * scale;
                     float minimumApiX = Math.Max(minResetX + resetWidth, valueRight) + groupGap;
@@ -502,8 +572,14 @@ internal sealed class UsageWidget : Form
                     g.DrawString(weekResetLabel, resetFont, resetBrush, new PointF(resetX, resetTop), format);
                     if (apiSlotVisible) {
                         DrawIcon(g, claudeIcon, apiX, iconCenterY, iconSize);
-                        using (var apiBrush = new SolidBrush(ApiAmountColor(apiCredit.Amount)))
-                            g.DrawString(apiCredit.Display, font, apiBrush, new PointF(apiX + iconSize + 6 * scale, titleTop), format);
+                        float amountX = apiX + iconSize + 6 * scale;
+                        using (var apiBrush = new SolidBrush(ApiAmountColor(apiCredit.Amount))) {
+                            g.DrawString(apiCredit.Display, font, apiBrush, new PointF(amountX, titleTop), format);
+                            if (!claudeCodeOpen) {
+                                using (var starFont = new Font(font.FontFamily, 8 * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                                    g.DrawString("*", starFont, apiBrush, new PointF(amountX + amountWidth + scale, titleTop - 2 * scale), format);
+                            }
+                        }
                     }
                 }
             }
@@ -512,7 +588,10 @@ internal sealed class UsageWidget : Form
             try {
                 var position = new POINT(Left, Top); var size = new SIZE(Width, Height); var origin = new POINT(0,0);
                 var blend = new BLEND { Operation=0, Flags=0, Alpha=255, Format=1 };
-                if (UpdateLayeredWindow(Handle, dc, ref position, ref size, memory, ref origin, 0, ref blend, 2)) lastLayer = signature;
+                if (UpdateLayeredWindow(Handle, dc, ref position, ref size, memory, ref origin, 0, ref blend, 2)) {
+                    lastLayer = signature;
+                    nextLayerRefresh = DateTime.UtcNow.AddSeconds(8);
+                }
             } finally { SelectObject(memory, previous); DeleteObject(dib); DeleteDC(memory); ReleaseDC(IntPtr.Zero, dc); }
         }
     }
@@ -603,7 +682,8 @@ internal sealed class UsageWidget : Form
         if (stale) detail += "\n未能更新，带 * 的数字为上次成功读取值。\n" + error;
         detail += "\nOpenAI API 余额：" + apiCredit.Display;
         if (apiCredit.LastRead.HasValue) detail += " · " + apiCredit.LastRead.Value.ToLocalTime().ToString("MM-dd HH:mm:ss");
-        if (apiCredit.Stale) detail += "\n" + apiCredit.Note;
+        if (!claudeCodeOpen) detail += "\n* Claude Code 未运行，显示上次余额，已暂停查询。";
+        else if (apiCredit.Stale) detail += "\n" + apiCredit.Note;
         else detail += "\n来自 OpenAI Platform，每 5 分钟更新";
         detail += "\n双击刷新 · 拖动调整位置 · 右键菜单";
         tip.SetToolTip(this, detail);
@@ -620,7 +700,8 @@ internal sealed class UsageWidget : Form
                 updated = lastUpdated.HasValue ? lastUpdated.Value.ToString("o") : null,
                 apiCredit = apiCredit.Display, apiCreditUpdated = apiCredit.LastRead, apiCreditStale = apiCredit.Stale,
                 apiSlotVisible = apiSlotVisible, requiredBalanceWidth = requiredBalanceWidth, startButtonLeft = startButtonLeft,
-                apiCreditError = apiCredit.Stale ? apiCredit.Note : null,
+                claudeCodeOpen = claudeCodeOpen, apiCreditPaused = !claudeCodeOpen, apiQueryRunning = creditRequest != null,
+                apiCreditError = claudeCodeOpen && apiCredit.Stale ? apiCredit.Note : null,
                 codexOpen = codexOpen, visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale,
                 hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = taskbarOwner != IntPtr.Zero,
                 job = Program.JobState,
