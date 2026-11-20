@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Threading;
+using System.Web.Script.Serialization;
 
 internal static class UsageTests
 {
@@ -61,14 +62,50 @@ internal static class UsageTests
         var balance = new ApiCreditBalance();
         balance.Load(directory);
         Check(balance.Amount == 12.30m && balance.Stale && balance.LastRead == previous, "old cache format still loads");
-        using (File.Open(cache, FileMode.Open, FileAccess.Read, FileShare.None)) balance.Update(-1.25m, directory);
+        using (File.Open(cache, FileMode.Open, FileAccess.Read, FileShare.None)) {
+            balance.Update(-1.25m, directory);
+            Check(!balance.FlushCache(directory), "wait to release the worker while its last balance cannot be saved");
+        }
         Check(balance.Display == "-$1.25" && !balance.Stale, "new reading stays available in memory if the cache is busy");
         var reloaded = new ApiCreditBalance();
         reloaded.Load(directory);
         Check(reloaded.Amount == 12.30m && reloaded.LastRead == previous, "locked cache retains its previous complete reading");
-        balance.Update(-1.25m, directory);
+        DateTime? lastRead = balance.LastRead;
+        Check(balance.FlushCache(directory) && balance.LastRead == lastRead, "retry a pending balance without changing its timestamp");
         reloaded.Load(directory);
         Check(reloaded.Display == "-$1.25" && reloaded.LastRead == balance.LastRead && reloaded.Stale, "new cache survives restart");
+    }
+
+    static void CheckIdleReadings(string directory) {
+        string statusPath = Path.Combine(directory, "status.json");
+        var json = new JavaScriptSerializer();
+        DateTime updated = new DateTime(2026, 1, 2, 4, 5, 6, DateTimeKind.Local);
+        string timestamp = updated.ToString("o", CultureInfo.InvariantCulture);
+        string reset = updated.AddDays(1).ToString("o", CultureInfo.InvariantCulture);
+        File.WriteAllText(statusPath, json.Serialize(new {
+            hasFiveHour = false, hasWeekly = true, weeklyRemaining = 81.5m, weeklyReset = reset,
+            updated = timestamp, apiCredit = "-$2.50", apiCreditUpdated = updated.ToUniversalTime(), offset = 233, hideCount = 4
+        }));
+        // The hidden form never enters a message loop or queries a real client.
+        using (File.Open(Path.Combine(directory, "api-credit.txt"), FileMode.Open, FileAccess.Read, FileShare.None))
+        using (File.Open(Path.Combine(directory, "settings.json"), FileMode.Open, FileAccess.Read, FileShare.None))
+        using (var widget = new UsageWidget(directory)) {
+            using (File.Open(statusPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                Check(!widget.TryRestorePausedUsage(), "retry a locked handoff");
+            Check(widget.TryRestorePausedUsage() && widget.WriteStatus(true), "resume from the last hidden status");
+            var status = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(statusPath));
+            Check(Equals(status["stale"], true) && Equals(status["weeklyRemaining"], 81.5m)
+                && Equals(status["hasWeekly"], true) && Equals(status["hasFiveHour"], false)
+                && status["fiveHourRemaining"] == null, "keep a weekly-only reading and its stale marker");
+            Check(Equals(status["updated"], timestamp) && Equals(status["weeklyReset"], reset), "preserve read and reset times");
+            Check(Equals(status["apiCredit"], "-$2.50") && Equals(status["offset"], 233), "restore balance and position when their files are busy");
+            Check(Equals(status["hideCount"], 4), "keep the hide counter across automatic worker restarts");
+            File.WriteAllText(statusPath, json.Serialize(new { updated = timestamp, hasWeekly = true, weeklyRemaining = 1 }));
+            Check(widget.TryRestorePausedUsage() && widget.WriteStatus(true)
+                && Equals(json.Deserialize<Dictionary<string, object>>(File.ReadAllText(statusPath))["weeklyRemaining"], 81.5m),
+                "a delayed restore cannot replace a reading already in memory");
+            widget.Close();
+        }
     }
 
     // The test executable also acts as a local app-server speaking the normal line protocol.
@@ -134,6 +171,7 @@ internal static class UsageTests
         Check(UsageWidget.Remaining(five) == 90 && week == null, "retry succeeds with the legacy single-bucket response");
     }
 
+    [STAThread]
     static int Main(string[] args) {
         if (args.Length == 1 && args[0] == "app-server") return RunFixtureServer();
         try {
@@ -159,13 +197,14 @@ internal static class UsageTests
             Check(UsageWidget.ApiAmountColor(34m) == UsageWidget.ApiAmountColor(66.99m)
                 && UsageWidget.ApiAmountColor(66.99m).ToArgb() == Color.FromArgb(255, 209, 102).ToArgb(), "34 to 66.99 USD is yellow");
             Check(UsageWidget.ApiAmountColor(67m).ToArgb() == Color.FromArgb(125, 221, 183).ToArgb(), "67 USD and up is green");
-            Check(UsageWidget.IsClaudeCodeExecutable(@"C:\Users\Demo\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe"), "npm Claude Code native launcher");
-            Check(UsageWidget.IsClaudeCodeExecutable(@"C:\Users\Demo\.local\bin\claude.exe"), "standalone Claude Code installer");
-            Check(!UsageWidget.IsClaudeCodeExecutable(@"C:\Program Files\WindowsApps\Claude_1.0.0_x64\app\claude.exe"), "Claude Desktop does not start API polling");
+            Check(ClientProcesses.IsClaudeCodeExecutable(@"C:\Users\Demo\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe"), "npm Claude Code native launcher");
+            Check(ClientProcesses.IsClaudeCodeExecutable(@"C:\Users\Demo\.local\bin\claude.exe"), "standalone Claude Code installer");
+            Check(!ClientProcesses.IsClaudeCodeExecutable(@"C:\Program Files\WindowsApps\Claude_1.0.0_x64\app\claude.exe"), "Claude Desktop does not start API polling");
+            Check(!ClientProcesses.IsClaudeCodeExecutable(null), "a process that disappeared during inspection is ignored");
             CheckNumbers();
             string directory = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "fixtures-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(directory);
-            try { CheckStateFiles(directory); CheckQueries(directory); }
+            try { CheckStateFiles(directory); CheckIdleReadings(directory); CheckQueries(directory); }
             finally {
                 foreach (string file in Directory.GetFiles(directory)) File.Delete(file);
                 Directory.Delete(directory);

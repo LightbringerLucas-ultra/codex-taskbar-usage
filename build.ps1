@@ -6,7 +6,7 @@ $compiler = Join-Path $framework 'csc.exe'
 if (-not (Test-Path -LiteralPath $compiler)) { throw '未找到 .NET Framework C# 编译器。' }
 
 $src = Join-Path $PSScriptRoot 'src'
-$sources = @((Join-Path $src 'CodexTaskbarUsage.cs'), (Join-Path $src 'ApiCreditBalance.cs'))
+$sources = @((Join-Path $src 'CodexTaskbarUsage.cs'), (Join-Path $src 'ApiCreditBalance.cs'), (Join-Path $src 'ClientProcesses.cs'))
 $references = @(
     '/reference:System.dll', '/reference:System.Core.dll', '/reference:System.Drawing.dll',
     '/reference:System.Windows.Forms.dll', '/reference:System.Web.Extensions.dll',
