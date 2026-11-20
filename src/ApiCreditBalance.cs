@@ -18,6 +18,8 @@ internal sealed class ApiCreditBalance
     static readonly string Node = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"nodejs\node.exe");
     static readonly string ScriptDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), AppDataScript);
     static readonly string Common = " --session " + Session + " --window background";
+    // Capture the sign on either side of the currency symbol, then the unsigned amount.
+    const string DollarAmount = @"^(?:([-−])(?:US)?\$\s*|(?:US)?\$\s*([-−])?)((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\.[0-9]{2})$";
 
     // Read the visible Credit remaining tile, without using browser storage or network internals.
     const string ExtractBalance = @"(() => {
@@ -25,7 +27,7 @@ internal sealed class ApiCreditBalance
       const label = Array.from(document.querySelectorAll('body *')).find(e => e.children.length === 0 && e.textContent.trim() === 'Credit remaining' && e.getClientRects().length);
       for (let row = label && label.parentElement, i = 0; row && i < 4; row = row.parentElement, i++) {
         const amounts = Array.from(row.querySelectorAll('*')).filter(e => e.children.length === 0 && e.getClientRects().length)
-          .map(e => e.textContent.trim()).filter(t => /^(?:US)?\$\s*[−-]?[0-9][0-9,]*\.[0-9]{2}$/.test(t));
+          .map(e => e.textContent.trim()).filter(t => /" + DollarAmount + @"/.test(t));
         if (amounts.length === 1) return amounts[0];
       }
       return null;
@@ -66,18 +68,25 @@ internal sealed class ApiCreditBalance
         LastRead = DateTime.UtcNow;
         Stale = false;
         Note = null;
-        try {
-            File.WriteAllLines(Path.Combine(store, "api-credit.txt"), new[] {
-                value.ToString(CultureInfo.InvariantCulture), LastRead.Value.ToString("o", CultureInfo.InvariantCulture)
-            });
-        } catch (IOException) { }
-          catch (UnauthorizedAccessException) { }
+        Program.TryWriteState(Path.Combine(store, "api-credit.txt"), value.ToString(CultureInfo.InvariantCulture)
+            + Environment.NewLine + LastRead.Value.ToString("o", CultureInfo.InvariantCulture) + Environment.NewLine);
     }
 
     internal void MarkStale(string note)
     {
         Stale = true;
         Note = note;
+    }
+
+    internal static bool TryParseAmount(string text, out decimal value)
+    {
+        value = 0;
+        if (text == null) return false;
+        Match match = Regex.Match(text, DollarAmount);
+        if (!match.Success || !Decimal.TryParse(match.Groups[3].Value, NumberStyles.Number, CultureInfo.InvariantCulture, out value))
+            return false;
+        if (match.Groups[1].Success || match.Groups[2].Success) value = -value;
+        return true;
     }
 
     internal static decimal Read(CancellationToken cancellation)
@@ -101,10 +110,7 @@ internal sealed class ApiCreditBalance
                     cancellation.ThrowIfCancellationRequested();
                 string result = Run(readAmount, profileArgument, 15000, cancellation) as string;
                 decimal balance;
-                if (result != null && Regex.IsMatch(result, @"^(?:US)?\$\s*[−-]?[0-9][0-9,]*\.[0-9]{2}$")
-                    && Decimal.TryParse(result.Replace("US", "").Replace("$", "").Replace("−", "-").Trim(),
-                        NumberStyles.Number, CultureInfo.InvariantCulture, out balance))
-                    return balance;
+                if (TryParseAmount(result, out balance)) return balance;
             }
             throw new InvalidOperationException("OpenAI Platform 未显示可读取的美元余额。");
         } finally {
@@ -200,13 +206,13 @@ internal sealed class ApiCreditBalance
             object pid, pending;
             if (daemon.HasExited) return;
             if (!TryReadBridgeStatus(out status)) {
-                if (!BridgeListening()) KillProcess(daemon); // Cancelled before startup completed.
+                if (!BridgeListening()) Program.KillProcess(daemon); // Cancelled before startup completed.
                 return;
             }
             if (status.TryGetValue("pid", out pid) && Equals(pid, daemon.Id)
                 && status.TryGetValue("pending", out pending) && Equals(pending, 0)
                 && IsEmptyList(status, "sessionLeases") && IsEmptyList(status, "siteSlots")) {
-                KillProcess(daemon);
+                Program.KillProcess(daemon);
                 daemon.WaitForExit(1000);
             }
         } catch (InvalidOperationException) { }
@@ -226,7 +232,7 @@ internal sealed class ApiCreditBalance
         var args = "\"" + Path.Combine(ScriptDirectory, "main.js") + "\" browser " + command + Common + profileArgument;
         var start = new ProcessStartInfo(Node, args) {
             UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
-            RedirectStandardOutput = true, RedirectStandardError = true
+            RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = System.Text.Encoding.UTF8
         };
         using (var process = Process.Start(start)) {
             try {
@@ -248,14 +254,7 @@ internal sealed class ApiCreditBalance
                 if (!result.TryGetValue("ok", out ok) || !Equals(ok, true) || !result.TryGetValue("data", out data))
                     throw new InvalidOperationException("OpenAI Platform 余额暂时不可用。");
                 return data;
-            } finally { KillProcess(process); }
+            } finally { Program.KillProcess(process); }
         }
-    }
-
-    static void KillProcess(Process process)
-    {
-        try { if (!process.HasExited) process.Kill(); }
-        catch (InvalidOperationException) { }
-        catch (System.ComponentModel.Win32Exception) { }
     }
 }

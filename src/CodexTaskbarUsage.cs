@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -17,11 +18,35 @@ using System.Windows.Forms;
 internal static class Program
 {
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int info, IntPtr buffer, uint size, out uint returned);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern bool MoveFileEx(string source, string destination, uint flags);
     const string TaskName = "外置大脑剩余";
     internal static readonly string DataDirectory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "..", "work", "runtime"));
     internal static readonly string JobState = ReadJobState();
     internal static readonly EventWaitHandle ExitSignal = new EventWaitHandle(false, EventResetMode.ManualReset, "Local\\CodexTaskbarUsage_Exit_JYH");
     static readonly string Store = DataDirectory;
+    internal static void KillProcess(Process process)
+    {
+        try { if (!process.HasExited) process.Kill(); }
+        catch (InvalidOperationException) { }
+        catch (System.ComponentModel.Win32Exception) { }
+    }
+
+    internal static bool TryWriteState(string path, string contents)
+    {
+        // Publish a complete file in one rename, including the first write.
+        const uint ReplaceExisting = 1;
+        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try {
+            File.WriteAllText(temporary, contents);
+            if (MoveFileEx(temporary, path, ReplaceExisting)) return true;
+        } catch (IOException) { }
+          catch (UnauthorizedAccessException) { }
+        try { File.Delete(temporary); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        return false;
+    }
     internal static void Log(string message)
     {
         try {
@@ -109,10 +134,10 @@ internal static class Program
                         UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
                         WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath)
                     })) {
-                        File.WriteAllText(Path.Combine(Store, "watchdog.json"), new JavaScriptSerializer().Serialize(new {
+                        if (!TryWriteState(Path.Combine(Store, "watchdog.json"), new JavaScriptSerializer().Serialize(new {
                             supervisorPid = Process.GetCurrentProcess().Id, workerPid = child.Id,
                             restartCount = restartCount, started = DateTime.Now.ToString("o"), job = JobState
-                        }));
+                        }))) Log("could not save watchdog.json");
                         Log("worker started pid=" + child.Id + " restartCount=" + restartCount);
                         child.WaitForExit();
                         Log("worker exited code=" + child.ExitCode);
@@ -184,7 +209,7 @@ internal sealed class UsageWidget : Form
     readonly ApiCreditBalance apiCredit = new ApiCreditBalance();
     readonly Bitmap claudeIcon = LoadIcon("Claude.png");
     readonly Bitmap codexIcon = LoadIcon("Codex.png");
-    bool busy, stale = true, dragging;
+    bool stale = true, dragging;
     int offset = 152;
     int dragOrigin;
     Point dragMouse;
@@ -198,12 +223,12 @@ internal sealed class UsageWidget : Form
     IntPtr taskbarOwner, fullscreenCandidate;
     DateTime fullscreenSince, nextWindowCheck, nextRefresh, nextCreditRefresh, nextTaskbarCheck, nextLayerRefresh;
     bool checkingTaskbar, checkingApps, apiSlotVisible;
-    CancellationTokenSource creditRequest;
+    CancellationTokenSource usageRequest, creditRequest;
     int? startButtonLeft;
     int requiredBalanceWidth;
     int hideCount;
     bool codexOpen, claudeCodeOpen;
-    bool intentionalExit;
+    bool intentionalExit, closing;
     string hiddenReason;
     readonly bool verifyMode = Array.IndexOf(Environment.GetCommandLineArgs(), "--verify") >= 0;
 
@@ -249,13 +274,14 @@ internal sealed class UsageWidget : Form
         locationTimer.Interval = 250;
         locationTimer.Tick += delegate { UpdateWidget(); };
         FormClosing += delegate(object sender, FormClosingEventArgs e) {
+            closing = true;
+            locationTimer.Stop();
             if (e.CloseReason == CloseReason.WindowsShutDown) intentionalExit = true;
-            if (creditRequest != null) {
-                creditRequest.Cancel();
-                if (intentionalExit && e.CloseReason != CloseReason.WindowsShutDown) {
-                    e.Cancel = true;
-                    return; // Let the query close its browser session before exiting.
-                }
+            if (usageRequest != null) usageRequest.Cancel();
+            if (creditRequest != null) creditRequest.Cancel();
+            if (e.CloseReason != CloseReason.WindowsShutDown && (usageRequest != null || creditRequest != null)) {
+                e.Cancel = true;
+                return; // FinishRefresh closes the form after both queries release their resources.
             }
             Program.Log("form closing reason=" + e.CloseReason + " intentional=" + intentionalExit);
         };
@@ -283,10 +309,7 @@ internal sealed class UsageWidget : Form
             CheckRunningApps();
         }
         PositionWidget();
-        if (codexOpen && now >= nextRefresh) {
-            nextRefresh = now.AddMinutes(1);
-            RefreshUsage();
-        }
+        if (codexOpen && now >= nextRefresh) RefreshUsage();
         if (claudeCodeOpen && now >= nextCreditRefresh) RefreshCredit();
     }
 
@@ -296,26 +319,41 @@ internal sealed class UsageWidget : Form
         try {
             // Reading a process's window or executable can stall during app startup or exit.
             bool[] running = await Task.Run(() => new[] { CodexWindowOpen(), ClaudeCodeOpen() });
-            if (IsDisposed) return;
-            bool wasOpen = codexOpen;
-            codexOpen = running[0];
-            if (codexOpen && !wasOpen) nextRefresh = DateTime.UtcNow;
-            bool claudeWasOpen = claudeCodeOpen;
-            claudeCodeOpen = running[1];
-            if (claudeCodeOpen != claudeWasOpen) {
-                nextCreditRefresh = claudeCodeOpen ? DateTime.UtcNow : DateTime.MaxValue;
-                if (!claudeCodeOpen && creditRequest != null) creditRequest.Cancel();
-                RenderUsage();
-            }
+            if (!IsDisposed && !closing) SetRunningApps(running[0], running[1]);
         } catch (System.ComponentModel.Win32Exception) { }
         finally { checkingApps = false; }
     }
 
+    void SetRunningApps(bool codexRunning, bool claudeRunning)
+    {
+        if (codexRunning == codexOpen && claudeRunning == claudeCodeOpen) return;
+        if (codexRunning != codexOpen) {
+            codexOpen = codexRunning;
+            stale = true;
+            error = codexOpen ? "正在读取 Codex 用量" : "Codex 未运行，已暂停查询。";
+            if (codexOpen) nextRefresh = DateTime.UtcNow;
+            else if (usageRequest != null) usageRequest.Cancel();
+        }
+        if (claudeRunning != claudeCodeOpen) {
+            claudeCodeOpen = claudeRunning;
+            nextCreditRefresh = claudeCodeOpen ? DateTime.UtcNow : DateTime.MaxValue;
+            if (!claudeCodeOpen && creditRequest != null) creditRequest.Cancel();
+        }
+        RenderUsage();
+    }
+
     void RefreshAll() { RefreshUsage(); RefreshCredit(); }
+
+    void FinishRefresh()
+    {
+        if (IsDisposed) return;
+        if (!closing) RenderUsage();
+        else if (usageRequest == null && creditRequest == null) Close();
+    }
 
     async void RefreshCredit()
     {
-        if (!claudeCodeOpen || creditRequest != null || IsDisposed) return;
+        if (!claudeCodeOpen || creditRequest != null || IsDisposed || closing) return;
         var request = new CancellationTokenSource();
         creditRequest = request;
         nextCreditRefresh = DateTime.UtcNow.AddMinutes(5);
@@ -331,8 +369,8 @@ internal sealed class UsageWidget : Form
         } finally {
             creditRequest = null;
             request.Dispose();
+            FinishRefresh();
         }
-        if (!IsDisposed) RenderUsage();
     }
 
     static bool CodexWindowOpen()
@@ -392,7 +430,11 @@ internal sealed class UsageWidget : Form
             || normalized.Contains(@"\.bun\bin\");
     }
 
-    void SaveSettings() { File.WriteAllText(Path.Combine(store, "settings.json"), json.Serialize(new { offset = offset })); }
+    void SaveSettings()
+    {
+        if (!Program.TryWriteState(Path.Combine(store, "settings.json"), json.Serialize(new { offset = offset })))
+            Program.Log("could not save settings.json");
+    }
     void DragDown(object sender, MouseEventArgs e) {
         if (e.Button != MouseButtons.Left) return;
         dragging = true; dragMouse = Cursor.Position; dragOrigin = offset;
@@ -678,7 +720,8 @@ internal sealed class UsageWidget : Form
         if (fiveReset.HasValue) detail += "\n5 小时重置：" + fiveReset.Value.ToString("MM-dd HH:mm");
         if (weekReset.HasValue) detail += "\n每周重置：" + weekReset.Value.ToString("MM-dd HH:mm");
         if (lastUpdated.HasValue) detail += "\n更新：" + lastUpdated.Value.ToString("HH:mm:ss");
-        if (stale) detail += "\n未能更新，带 * 的数字为上次成功读取值。\n" + error;
+        if (!codexOpen) detail += "\nCodex 未运行，已暂停查询。";
+        else if (stale) detail += "\n尚未更新，带 * 的数字为上次成功读取值。\n" + error;
         detail += "\nOpenAI API 余额：" + apiCredit.Display;
         if (apiCredit.LastRead.HasValue) detail += " · " + apiCredit.LastRead.Value.ToLocalTime().ToString("MM-dd HH:mm:ss");
         if (!claudeCodeOpen) detail += "\n* Claude Code 未运行，显示上次余额，已暂停查询。";
@@ -707,19 +750,27 @@ internal sealed class UsageWidget : Form
                 error = stale ? error : null
             });
             if (status == lastStatus) return;
-            File.WriteAllText(Path.Combine(store, "status.json"), status);
-            lastStatus = status;
+            if (Program.TryWriteState(Path.Combine(store, "status.json"), status)) lastStatus = status;
         } catch { }
     }
     static Dictionary<string, object> Obj(object o) { return o as Dictionary<string, object>; }
     static object Field(Dictionary<string, object> o, string k) { object v; return o != null && o.TryGetValue(k, out v) ? v : null; }
-    static double? Remaining(Dictionary<string, object> window) {
-        var used = Field(window, "usedPercent");
-        return used == null ? (double?)null : Math.Max(0, Math.Min(100, 100 - Convert.ToDouble(used)));
+    static double? NumberField(Dictionary<string, object> window, string key)
+    {
+        object value = Field(window, key);
+        if (value == null) return null;
+        double number;
+        if (Double.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), NumberStyles.Float,
+            CultureInfo.InvariantCulture, out number) && !Double.IsNaN(number) && !Double.IsInfinity(number)) return number;
+        throw new FormatException("Codex 额度字段 " + key + " 不是有效数字。");
+    }
+    internal static double? Remaining(Dictionary<string, object> window) {
+        double? used = NumberField(window, "usedPercent");
+        return used.HasValue ? Math.Max(0, Math.Min(100, 100 - used.Value)) : (double?)null;
     }
     static DateTime? Reset(Dictionary<string, object> window) {
-        var unix = Field(window, "resetsAt");
-        return unix == null ? (DateTime?)null : new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc).AddSeconds(Convert.ToDouble(unix)).ToLocalTime();
+        double? unix = NumberField(window, "resetsAt");
+        return unix.HasValue ? new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc).AddSeconds(unix.Value).ToLocalTime() : (DateTime?)null;
     }
     internal static void SelectWindows(Dictionary<string, object> limits, out Dictionary<string, object> fiveWindow, out Dictionary<string, object> weekWindow)
     {
@@ -728,7 +779,7 @@ internal sealed class UsageWidget : Form
             var duration = Field(window, "windowDurationMins");
             if (duration == null) continue;
             double minutes;
-            if (!Double.TryParse(Convert.ToString(duration, System.Globalization.CultureInfo.InvariantCulture), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out minutes)) continue;
+            if (!Double.TryParse(Convert.ToString(duration, CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture, out minutes)) continue;
             if (minutes == 300 && fiveWindow == null) fiveWindow = window;
             if (minutes == 10080 && weekWindow == null) weekWindow = window;
         }
@@ -744,39 +795,44 @@ internal sealed class UsageWidget : Form
         }
         throw new Exception("未找到本机 Codex，打开 Codex 并确认已登录后重试。");
     }
-    async Task<string> ReadLine(Process p, DateTime deadline)
+    static async Task<Dictionary<string, object>> ReadReply(StreamReader output, JavaScriptSerializer serializer,
+        string expectedId, Task deadline, CancellationToken cancellation)
     {
-        var reading = p.StandardOutput.ReadLineAsync();
-        int delay = Math.Max(1, (int)(deadline - DateTime.UtcNow).TotalMilliseconds);
-        if (await Task.WhenAny(reading, Task.Delay(delay)) != reading) throw new Exception("读取超时，稍后自动重试。");
-        string line = await reading;
-        if (line == null) throw new Exception("Codex 用量接口已关闭。");
-        return line;
+        while (!deadline.IsCompleted) {
+            var reading = output.ReadLineAsync();
+            if (await Task.WhenAny(deadline, reading).ConfigureAwait(false) == deadline) break;
+            string line = await reading.ConfigureAwait(false);
+            cancellation.ThrowIfCancellationRequested();
+            if (line == null) throw new EndOfStreamException("Codex 用量接口已关闭。");
+            var packet = serializer.Deserialize<Dictionary<string, object>>(line);
+            if (Convert.ToString(Field(packet, "id"), CultureInfo.InvariantCulture) == expectedId) return packet;
+        }
+        cancellation.ThrowIfCancellationRequested();
+        throw new TimeoutException("读取超时，稍后自动重试。");
     }
-    async Task<Dictionary<string, object>> FetchUsage()
+    internal static async Task<Dictionary<string, object>> FetchUsage(string executable, string directory,
+        CancellationToken cancellation, int timeoutMilliseconds = 25000)
     {
-        using (var p = new Process()) {
-            p.StartInfo = new ProcessStartInfo(FindCodex(), "app-server") {
+        cancellation.ThrowIfCancellationRequested();
+        using (var p = new Process())
+        using (var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellation)) {
+            p.StartInfo = new ProcessStartInfo(executable, "app-server") {
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
-                WorkingDirectory = store
+                StandardOutputEncoding = System.Text.Encoding.UTF8, WorkingDirectory = directory
             };
-            p.Start(); p.BeginErrorReadLine();
+            var serializer = new JavaScriptSerializer();
+            p.Start();
             try {
-                DateTime deadline = DateTime.UtcNow.AddSeconds(25);
-                p.StandardInput.WriteLine("{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"codex_taskbar_usage\",\"title\":\"Codex Taskbar Usage\",\"version\":\"1.0\"}}}");
-                while (true) {
-                    var packet = json.Deserialize<Dictionary<string, object>>(await ReadLine(p, deadline));
-                    if (Convert.ToString(Field(packet, "id")) == "1") {
-                        if (Field(packet, "error") != null) throw new Exception("Codex 用量接口初始化失败。");
-                        break;
-                    }
-                }
-                p.StandardInput.WriteLine("{\"method\":\"initialized\",\"params\":{}}");
-                p.StandardInput.WriteLine("{\"id\":2,\"method\":\"account/rateLimits/read\"}");
-                while (true) {
-                    var packet = json.Deserialize<Dictionary<string, object>>(await ReadLine(p, deadline));
-                    if (Convert.ToString(Field(packet, "id")) != "2") continue;
+                using (cancellation.Register(() => Program.KillProcess(p))) {
+                    var deadline = Task.Delay(timeoutMilliseconds, stop.Token);
+                    p.BeginErrorReadLine();
+                    p.StandardInput.WriteLine("{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"codex_taskbar_usage\",\"title\":\"Codex Taskbar Usage\",\"version\":\"1.0\"}}}");
+                    var init = await ReadReply(p.StandardOutput, serializer, "1", deadline, cancellation).ConfigureAwait(false);
+                    if (Field(init, "error") != null) throw new Exception("Codex 用量接口初始化失败。");
+                    p.StandardInput.WriteLine("{\"method\":\"initialized\",\"params\":{}}");
+                    p.StandardInput.WriteLine("{\"id\":2,\"method\":\"account/rateLimits/read\"}");
+                    var packet = await ReadReply(p.StandardOutput, serializer, "2", deadline, cancellation).ConfigureAwait(false);
                     if (Field(packet, "error") != null) throw new Exception("无法读取用量，请确认 Codex 已登录。");
                     var result = Obj(Field(packet, "result"));
                     var buckets = Obj(Field(result, "rateLimitsByLimitId"));
@@ -784,16 +840,25 @@ internal sealed class UsageWidget : Form
                     if (limits == null) throw new Exception("账号未提供 Codex 额度信息。");
                     return limits;
                 }
-            } finally { try { if (!p.HasExited) { p.Kill(); p.WaitForExit(2000); } } catch { } }
+            } catch {
+                cancellation.ThrowIfCancellationRequested();
+                throw;
+            } finally {
+                stop.Cancel();
+                Program.KillProcess(p);
+                p.WaitForExit(2000);
+            }
         }
     }
     async void RefreshUsage()
     {
-        if (!codexOpen || busy || IsDisposed) return;
-        busy = true;
+        if (!codexOpen || usageRequest != null || IsDisposed || closing) return;
+        var request = new CancellationTokenSource();
+        usageRequest = request;
+        nextRefresh = DateTime.UtcNow.AddMinutes(1);
         try {
-            var limits = await FetchUsage();
-            if (IsDisposed) return;
+            var limits = await Task.Run(() => FetchUsage(FindCodex(), store, request.Token));
+            if (IsDisposed || request.IsCancellationRequested) return;
             Dictionary<string, object> fiveWindow, weekWindow;
             SelectWindows(limits, out fiveWindow, out weekWindow);
             // Complete conversion before updating the current display; a malformed response
@@ -804,8 +869,14 @@ internal sealed class UsageWidget : Form
             fiveLeft = nextFive; weekLeft = nextWeek;
             fiveReset = nextFiveReset; weekReset = nextWeekReset;
             lastUpdated = DateTime.Now; stale = false; error = null;
-        } catch (Exception ex) { if (IsDisposed) return; stale = true; error = ex.Message; }
-        finally { busy = false; }
-        if (!IsDisposed) RenderUsage();
+        } catch (Exception ex) {
+            if (IsDisposed || request.IsCancellationRequested) return;
+            stale = true;
+            error = ex.Message;
+        } finally {
+            usageRequest = null;
+            request.Dispose();
+            FinishRefresh();
+        }
     }
 }
