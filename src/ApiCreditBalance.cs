@@ -34,6 +34,7 @@ internal sealed class ApiCreditBalance
     })()";
 
     decimal? amount;
+    bool cachePending;
     internal decimal? Amount { get { return amount; } }
     internal DateTime? LastRead { get; private set; }
     internal bool Stale { get; private set; }
@@ -54,12 +55,17 @@ internal sealed class ApiCreditBalance
             DateTime read;
             if (record.Length == 2 && Decimal.TryParse(record[0], NumberStyles.Number, CultureInfo.InvariantCulture, out value)
                 && DateTime.TryParseExact(record[1], "o", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out read)) {
-                amount = value;
-                LastRead = read;
-                MarkStale("显示上一次读取的余额，正在等待更新。");
+                Restore(value, read);
             }
         } catch (IOException) { }
           catch (UnauthorizedAccessException) { }
+    }
+
+    internal void Restore(decimal value, DateTime read)
+    {
+        amount = value;
+        LastRead = read;
+        MarkStale("显示上一次读取的余额，正在等待更新。");
     }
 
     internal void Update(decimal value, string store)
@@ -68,8 +74,16 @@ internal sealed class ApiCreditBalance
         LastRead = DateTime.UtcNow;
         Stale = false;
         Note = null;
-        Program.TryWriteState(Path.Combine(store, "api-credit.txt"), value.ToString(CultureInfo.InvariantCulture)
+        cachePending = true;
+        FlushCache(store);
+    }
+
+    internal bool FlushCache(string store)
+    {
+        if (!cachePending) return true;
+        cachePending = !Program.TryWriteState(Path.Combine(store, "api-credit.txt"), amount.Value.ToString(CultureInfo.InvariantCulture)
             + Environment.NewLine + LastRead.Value.ToString("o", CultureInfo.InvariantCulture) + Environment.NewLine);
+        return !cachePending;
     }
 
     internal void MarkStale(string note)

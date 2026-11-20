@@ -21,7 +21,10 @@ internal static class Program
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     static extern bool MoveFileEx(string source, string destination, uint flags);
     const string TaskName = "外置大脑剩余";
-    internal static readonly string DataDirectory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "..", "work", "runtime"));
+    const string SupervisorMutex = "Local\\CodexTaskbarUsage_Supervisor_JYH";
+    internal const int IdleExitCode = 74;
+    static readonly string Executable = (Assembly.GetEntryAssembly() ?? Assembly.GetExecutingAssembly()).Location;
+    internal static readonly string DataDirectory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Executable), "..", "work", "runtime"));
     internal static readonly string JobState = ReadJobState();
     internal static readonly EventWaitHandle ExitSignal = new EventWaitHandle(false, EventResetMode.ManualReset, "Local\\CodexTaskbarUsage_Exit_JYH");
     static readonly string Store = DataDirectory;
@@ -75,7 +78,12 @@ internal static class Program
                 return;
             } catch (Exception ex) { Log("scheduler launch unavailable: " + ex.Message); Environment.ExitCode = 76; return; }
         }
-        if (Array.IndexOf(args, "--worker") < 0 && Array.IndexOf(args, "--verify") < 0) { Supervise(); return; }
+        if (!directWorker) { Supervise(); return; }
+        RunWorker();
+    }
+
+    static void RunWorker()
+    {
         bool created;
         using (var mutex = new Mutex(true, "Local\\CodexTaskbarUsage_JYH", out created))
         {
@@ -120,28 +128,36 @@ internal static class Program
     static void Supervise()
     {
         bool created;
-        using (var mutex = new Mutex(true, "Local\\CodexTaskbarUsage_Supervisor_JYH", out created)) {
+        using (var mutex = new Mutex(true, SupervisorMutex, out created)) {
             if (!created) return;
             ExitSignal.Reset();
             Directory.CreateDirectory(Store);
             if (File.Exists(Path.Combine(Store, "exit.request"))) File.Delete(Path.Combine(Store, "exit.request"));
             int restartCount = 0, quickFailures = 0;
+            bool resume = false;
             Log("supervisor started pid=" + Process.GetCurrentProcess().Id + " job=" + JobState);
             while (!ExitSignal.WaitOne(0)) {
                 DateTime started = DateTime.UtcNow;
                 try {
-                    using (var child = ExistingWorker() ?? Process.Start(new ProcessStartInfo(Application.ExecutablePath, "--worker") {
+                    int code;
+                    string arguments = resume ? "--worker --supervised --resume" : "--worker --supervised";
+                    using (var child = ExistingWorker() ?? Process.Start(new ProcessStartInfo(Executable, arguments) {
                         UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
-                        WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath)
+                        WorkingDirectory = Path.GetDirectoryName(Executable)
                     })) {
-                        if (!TryWriteState(Path.Combine(Store, "watchdog.json"), new JavaScriptSerializer().Serialize(new {
-                            supervisorPid = Process.GetCurrentProcess().Id, workerPid = child.Id,
-                            restartCount = restartCount, started = DateTime.Now.ToString("o"), job = JobState
-                        }))) Log("could not save watchdog.json");
+                        WriteWatchdog(child.Id, restartCount);
                         Log("worker started pid=" + child.Id + " restartCount=" + restartCount);
                         child.WaitForExit();
-                        Log("worker exited code=" + child.ExitCode);
-                        if (child.ExitCode == 0 || ExitSignal.WaitOne(0)) break;
+                        code = child.ExitCode;
+                    }
+                    Log("worker exited code=" + code);
+                    if (code == 0 || ExitSignal.WaitOne(0)) break;
+                    if (code == IdleExitCode) {
+                        WriteWatchdog(null, restartCount);
+                        if (!WaitForClient()) break;
+                        resume = true;
+                        quickFailures = 0;
+                        continue;
                     }
                 } catch (Exception ex) { Log("supervisor exception: " + ex.Message); }
                 restartCount++;
@@ -151,14 +167,44 @@ internal static class Program
             Log("supervisor stopped");
         }
     }
+    internal static bool HasSupervisor()
+    {
+        Mutex supervisor;
+        try {
+            if (!Mutex.TryOpenExisting(SupervisorMutex, out supervisor)) return false;
+            supervisor.Dispose();
+            return true;
+        } catch (UnauthorizedAccessException) { return false; }
+    }
+    static void WriteWatchdog(int? workerPid, int restartCount)
+    {
+        using (var supervisor = Process.GetCurrentProcess()) {
+            if (!TryWriteState(Path.Combine(Store, "watchdog.json"), new JavaScriptSerializer().Serialize(new {
+                supervisorPid = supervisor.Id, workerPid = workerPid, restartCount = restartCount,
+                started = DateTime.Now.ToString("o"), job = JobState
+            }))) Log("could not save watchdog.json");
+        }
+    }
+    static bool WaitForClient()
+    {
+        string exitRequest = Path.Combine(Store, "exit.request");
+        while (!ExitSignal.WaitOne(0) && !File.Exists(exitRequest)) {
+            try { if (ClientProcesses.Read() != Clients.None) return true; }
+            catch (System.ComponentModel.Win32Exception) { }
+            if (ExitSignal.WaitOne(1000)) break;
+        }
+        return false;
+    }
     static Process ExistingWorker()
     {
         Process candidate = null;
         try {
             var previous = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(Store, "watchdog.json")));
-            candidate = Process.GetProcessById(Convert.ToInt32(previous["workerPid"]));
+            int pid = Convert.ToInt32(previous["workerPid"]);
+            if (pid <= 0) return null;
+            candidate = Process.GetProcessById(pid);
             if (candidate.Id != Process.GetCurrentProcess().Id && !candidate.HasExited &&
-                String.Equals(candidate.MainModule.FileName, Application.ExecutablePath, StringComparison.OrdinalIgnoreCase)) {
+                String.Equals(candidate.MainModule.FileName, Executable, StringComparison.OrdinalIgnoreCase)) {
                 Log("adopting existing worker pid=" + candidate.Id);
                 return candidate;
             }
@@ -201,14 +247,13 @@ internal sealed class UsageWidget : Form
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
     [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr dc, ref POINT position, ref SIZE size, IntPtr source, ref POINT origin, uint key, ref BLEND blend, uint flags);
 
-    readonly string store = Program.DataDirectory;
+    readonly string store;
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
     const string WidgetTitle = "外置大脑剩余";
     readonly ToolTip tip = new ToolTip();
     readonly System.Windows.Forms.Timer locationTimer = new System.Windows.Forms.Timer();
     readonly ApiCreditBalance apiCredit = new ApiCreditBalance();
-    readonly Bitmap claudeIcon = LoadIcon("Claude.png");
-    readonly Bitmap codexIcon = LoadIcon("Codex.png");
+    Bitmap claudeIcon, codexIcon;
     bool stale = true, dragging;
     int offset = 152;
     int dragOrigin;
@@ -219,7 +264,7 @@ internal sealed class UsageWidget : Form
     DateTime? lastUpdated, fiveReset, weekReset;
     string error = "正在读取 Codex 用量";
     float scale = 1;
-    string lastLayer, lastStatus;
+    object lastLayer, lastStatus;
     IntPtr taskbarOwner, fullscreenCandidate;
     DateTime fullscreenSince, nextWindowCheck, nextRefresh, nextCreditRefresh, nextTaskbarCheck, nextLayerRefresh;
     bool checkingTaskbar, checkingApps, apiSlotVisible;
@@ -228,9 +273,11 @@ internal sealed class UsageWidget : Form
     int requiredBalanceWidth;
     int hideCount;
     bool codexOpen, claudeCodeOpen;
-    bool intentionalExit, closing;
+    bool intentionalExit, closing, idleExit, settingsPending, restorePending, useSavedOffset;
+    DateTime? idleSince;
     string hiddenReason;
     readonly bool verifyMode = Array.IndexOf(Environment.GetCommandLineArgs(), "--verify") >= 0;
+    readonly bool supervised = Array.IndexOf(Environment.GetCommandLineArgs(), "--supervised") >= 0;
 
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams
@@ -238,8 +285,10 @@ internal sealed class UsageWidget : Form
         get { var p = base.CreateParams; p.ExStyle |= 0x80000; if (!verifyMode) p.ExStyle |= 0x08000000 | 0x80; return p; }
     }
 
-    public UsageWidget()
+    public UsageWidget() : this(Program.DataDirectory) { }
+    internal UsageWidget(string store)
     {
+        this.store = store;
         Directory.CreateDirectory(store);
         Text = WidgetTitle;
         FormBorderStyle = FormBorderStyle.None;
@@ -252,15 +301,17 @@ internal sealed class UsageWidget : Form
         try {
             var saved = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(store, "settings.json")));
             offset = Convert.ToInt32(saved["offset"]);
-        } catch { }
+        } catch { useSavedOffset = true; }
         apiCredit.Load(store);
+        if (supervised && Array.IndexOf(Environment.GetCommandLineArgs(), "--resume") >= 0)
+            restorePending = !TryRestorePausedUsage();
         var menu = new ContextMenuStrip();
         menu.Items.Add("立即刷新", null, delegate { RefreshAll(); });
         menu.Items.Add("恢复左侧位置", null, delegate { offset = 152; SaveSettings(); PositionWidget(); });
         menu.Items.Add(new ToolStripSeparator());
         var startup = new ToolStripMenuItem("登录 Windows 后在后台运行");
         startup.CheckOnClick = true;
-        startup.Checked = Program.StartupEnabled();
+        menu.Opening += delegate { startup.Checked = Program.StartupEnabled(); };
         startup.Click += delegate {
             try {
                 Program.SetStartup(startup.Checked);
@@ -286,8 +337,10 @@ internal sealed class UsageWidget : Form
             Program.Log("form closing reason=" + e.CloseReason + " intentional=" + intentionalExit);
         };
         FormClosed += delegate {
-            Environment.ExitCode = intentionalExit || Program.ExitSignal.WaitOne(0) ? 0 : 75;
-            locationTimer.Dispose(); tip.Dispose(); claudeIcon.Dispose(); codexIcon.Dispose();
+            Environment.ExitCode = intentionalExit || Program.ExitSignal.WaitOne(0) ? 0 : (idleExit ? Program.IdleExitCode : 75);
+            locationTimer.Dispose(); tip.Dispose();
+            if (claudeIcon != null) claudeIcon.Dispose();
+            if (codexIcon != null) codexIcon.Dispose();
         };
         // Start hidden. The timer can close this form or show it when Codex opens.
         CreateHandle();
@@ -303,6 +356,10 @@ internal sealed class UsageWidget : Form
             return;
         }
 
+        if (restorePending && TryRestorePausedUsage()) {
+            restorePending = false;
+            RenderUsage();
+        }
         var now = DateTime.UtcNow;
         if (!checkingApps && now >= nextWindowCheck) {
             nextWindowCheck = now.AddSeconds(1);
@@ -318,10 +375,27 @@ internal sealed class UsageWidget : Form
         checkingApps = true;
         try {
             // Reading a process's window or executable can stall during app startup or exit.
-            bool[] running = await Task.Run(() => new[] { CodexWindowOpen(), ClaudeCodeOpen() });
-            if (!IsDisposed && !closing) SetRunningApps(running[0], running[1]);
-        } catch (System.ComponentModel.Win32Exception) { }
+            Clients running = await Task.Run(() => ClientProcesses.Read());
+            if (IsDisposed || closing) return;
+            SetRunningApps((running & Clients.Codex) != 0, (running & Clients.ClaudeCode) != 0);
+            if (supervised) CheckIdleExit(running);
+        } catch (System.ComponentModel.Win32Exception) { idleSince = null; }
         finally { checkingApps = false; }
+    }
+
+    void CheckIdleExit(Clients running)
+    {
+        if (running != Clients.None) { idleSince = null; return; }
+        // Keep quick close/reopen cycles in this worker. Release it only after cleanup
+        // and a durable handoff, so a locked cache cannot lose the last reading.
+        var now = DateTime.UtcNow;
+        if (!idleSince.HasValue) idleSince = now;
+        if ((now - idleSince.Value).TotalSeconds < 5 || usageRequest != null || creditRequest != null) return;
+        if (!Program.HasSupervisor()) return;
+        if (settingsPending) SaveSettings();
+        if (settingsPending || !apiCredit.FlushCache(store) || !WriteStatus(true)) return;
+        idleExit = true;
+        Close();
     }
 
     void SetRunningApps(bool codexRunning, bool claudeRunning)
@@ -373,66 +447,12 @@ internal sealed class UsageWidget : Form
         }
     }
 
-    static bool CodexWindowOpen()
-    {
-        // The Windows desktop package currently runs as ChatGPT.exe.
-        // A main window can be minimized; background processes have no main window.
-        foreach (string name in new[] { "ChatGPT", "Codex" }) {
-            var processes = Process.GetProcessesByName(name);
-            try {
-                foreach (var process in processes) {
-                    try {
-                        if (process.MainWindowHandle == IntPtr.Zero) continue;
-                        if (name == "Codex" || process.MainModule.FileName.IndexOf(
-                            @"\WindowsApps\OpenAI.Codex_", StringComparison.OrdinalIgnoreCase) >= 0)
-                            return true;
-                    } catch (InvalidOperationException) { }
-                      catch (System.ComponentModel.Win32Exception) { }
-                }
-            } finally {
-                foreach (var process in processes) process.Dispose();
-            }
-        }
-        return false;
-    }
-
-    static readonly int DesktopSession = CurrentSessionId();
-    static int CurrentSessionId() { using (var process = Process.GetCurrentProcess()) return process.SessionId; }
-
-    static bool ClaudeCodeOpen()
-    {
-        foreach (string name in new[] { "claude", "claude-code" }) {
-            var processes = Process.GetProcessesByName(name);
-            try {
-                foreach (var process in processes) {
-                    try {
-                        if (process.SessionId == DesktopSession && IsClaudeCodeExecutable(process.MainModule.FileName))
-                            return true;
-                    } catch (InvalidOperationException) { }
-                      catch (System.ComponentModel.Win32Exception) { }
-                }
-            } finally { foreach (var process in processes) process.Dispose(); }
-        }
-        return false;
-    }
-
-    internal static bool IsClaudeCodeExecutable(string path)
-    {
-        string normalized = path.Replace('/', '\\').ToLowerInvariant();
-        if (normalized.EndsWith(@"\claude-code.exe", StringComparison.Ordinal)) return true;
-        if (!normalized.EndsWith(@"\claude.exe", StringComparison.Ordinal)) return false;
-        return normalized.Contains(@"\@anthropic-ai\claude-code\")
-            || normalized.Contains(@"\@anthropic-ai\claude-code-win32-")
-            || normalized.Contains(@"\.local\bin\")
-            || normalized.Contains(@"\.local\share\claude\")
-            || normalized.Contains(@"\winget\packages\anthropic.claudecode_")
-            || normalized.Contains(@"\scoop\apps\claude-code\")
-            || normalized.Contains(@"\.bun\bin\");
-    }
-
     void SaveSettings()
     {
-        if (!Program.TryWriteState(Path.Combine(store, "settings.json"), json.Serialize(new { offset = offset })))
+        useSavedOffset = false;
+        bool wasPending = settingsPending;
+        settingsPending = !Program.TryWriteState(Path.Combine(store, "settings.json"), json.Serialize(new { offset = offset }));
+        if (settingsPending && !wasPending)
             Program.Log("could not save settings.json");
     }
     void DragDown(object sender, MouseEventArgs e) {
@@ -542,10 +562,9 @@ internal sealed class UsageWidget : Form
     void DrawLayer()
     {
         if (!IsHandleCreated || Width <= 0 || Height <= 0) return;
-        string signature = Width + ":" + Height + ":" + Left + ":" + Top + ":" + fiveLeft + ":" + weekLeft + ":" + stale
-            + ":" + ResetLabel(fiveReset, false) + ":" + ResetLabel(weekReset, true) + ":" + WeeklyOnly
-            + ":" + apiCredit.Display + ":" + !claudeCodeOpen + ":" + startButtonLeft;
-        if (lastLayer == signature && DateTime.UtcNow < nextLayerRefresh) return;
+        var signature = new { Bounds, scale, fiveLeft, weekLeft, stale, fiveReset, weekReset, WeeklyOnly,
+            apiCredit.Amount, claudeCodeOpen, startButtonLeft };
+        if (signature.Equals(lastLayer) && DateTime.UtcNow < nextLayerRefresh) return;
         using (var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppArgb)) {
             using (var g = Graphics.FromImage(bitmap)) {
                 // An almost invisible alpha gives the entire row a usable mouse target.
@@ -608,12 +627,14 @@ internal sealed class UsageWidget : Form
                     }
                     float captionTop = WeeklyOnly ? baseline - weeklyCaptionFont.Size * weeklyCaptionFont.FontFamily.GetCellAscent(weeklyCaptionFont.Style) / weeklyCaptionFont.FontFamily.GetEmHeight(weeklyCaptionFont.Style) : textTop;
                     g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    if (codexIcon == null) codexIcon = LoadIcon("Codex.png");
                     DrawIcon(g, codexIcon, codexX, iconCenterY, iconSize);
                     g.DrawString("每周", weeklyCaptionFont, captionBrush, new PointF(weekX, captionTop), format);
                     using (var valueBrush = new SolidBrush(AmountColor(weekLeft)))
                         g.DrawString(weekValue, font, valueBrush, new PointF(valueX, textTop), format);
                     g.DrawString(weekResetLabel, resetFont, resetBrush, new PointF(resetX, resetTop), format);
                     if (apiSlotVisible) {
+                        if (claudeIcon == null) claudeIcon = LoadIcon("Claude.png");
                         DrawIcon(g, claudeIcon, apiX, iconCenterY, iconSize);
                         float amountX = apiX + iconSize + 6 * scale;
                         using (var apiBrush = new SolidBrush(ApiAmountColor(apiCredit.Amount))) {
@@ -706,11 +727,11 @@ internal sealed class UsageWidget : Form
         return HighAmount;
     }
     static string Percent(double? v) { return v.HasValue ? v.Value.ToString("0.#") + "%" : "--"; }
+    static readonly string[] Weekdays = { "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
     static string ResetLabel(DateTime? reset, bool weekly)
     {
         if (!reset.HasValue) return "重置时间 --";
-        string[] weekdays = { "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
-        return (weekly ? weekdays[(int)reset.Value.DayOfWeek] + " " : "") + reset.Value.ToString("HH:mm") + " 重置";
+        return (weekly ? Weekdays[(int)reset.Value.DayOfWeek] + " " : "") + reset.Value.ToString("HH:mm") + " 重置";
     }
     void RenderUsage()
     {
@@ -731,10 +752,11 @@ internal sealed class UsageWidget : Form
         tip.SetToolTip(this, detail);
         PositionWidget();
     }
-    void WriteStatus()
+    internal bool WriteStatus(bool force = false)
     {
+        if (restorePending) return false;
         try {
-            string status = json.Serialize(new {
+            var status = new {
                 fiveHourRemaining = fiveLeft, weeklyRemaining = weekLeft, hasFiveHour = hasFive, hasWeekly = hasWeek, stale = stale,
                 fiveHourReset = fiveReset.HasValue ? fiveReset.Value.ToString("o") : null,
                 weeklyReset = weekReset.HasValue ? weekReset.Value.ToString("o") : null,
@@ -744,14 +766,53 @@ internal sealed class UsageWidget : Form
                 apiSlotVisible = apiSlotVisible, requiredBalanceWidth = requiredBalanceWidth, startButtonLeft = startButtonLeft,
                 claudeCodeOpen = claudeCodeOpen, apiCreditPaused = !claudeCodeOpen, apiQueryRunning = creditRequest != null,
                 apiCreditError = claudeCodeOpen && apiCredit.Stale ? apiCredit.Note : null,
-                codexOpen = codexOpen, visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale,
+                codexOpen = codexOpen, visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale, offset = offset,
                 hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = taskbarOwner != IntPtr.Zero,
                 job = Program.JobState,
                 error = stale ? error : null
-            });
-            if (status == lastStatus) return;
-            if (Program.TryWriteState(Path.Combine(store, "status.json"), status)) lastStatus = status;
+            };
+            if (!force && status.Equals(lastStatus)) return true;
+            if (!Program.TryWriteState(Path.Combine(store, "status.json"), json.Serialize(status))) return false;
+            lastStatus = status;
+            return true;
         } catch { }
+        return false;
+    }
+    static DateTime? StoredDate(Dictionary<string, object> record, string field)
+    {
+        string value = Field(record, field) as string;
+        return value == null ? (DateTime?)null : DateTime.ParseExact(value, "o", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+    }
+    internal bool TryRestorePausedUsage()
+    {
+        try {
+            var saved = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(store, "status.json")));
+            object savedOffset = Field(saved, "offset");
+            if (useSavedOffset && savedOffset is int) { offset = (int)savedOffset; useSavedOffset = false; }
+            object count = Field(saved, "hideCount");
+            if (count is int) hideCount = Math.Max(hideCount, (int)count);
+            DateTime? balanceRead = Field(saved, "apiCreditUpdated") as DateTime?;
+            decimal balance;
+            if (!apiCredit.Amount.HasValue && balanceRead.HasValue && ApiCreditBalance.TryParseAmount(Field(saved, "apiCredit") as string, out balance))
+                apiCredit.Restore(balance, balanceRead.Value);
+            // A fresh quota request may have finished while the old file was locked.
+            if (lastUpdated.HasValue) return true;
+            DateTime? updated = StoredDate(saved, "updated");
+            if (!updated.HasValue) return true;
+            double? five = NumberField(saved, "fiveHourRemaining"), week = NumberField(saved, "weeklyRemaining");
+            DateTime? shortReset = StoredDate(saved, "fiveHourReset"), longReset = StoredDate(saved, "weeklyReset");
+            hasFive = Equals(Field(saved, "hasFiveHour"), true);
+            hasWeek = Equals(Field(saved, "hasWeekly"), true);
+            fiveLeft = five; weekLeft = week;
+            fiveReset = shortReset; weekReset = longReset;
+            lastUpdated = updated;
+            stale = true;
+            if (!codexOpen) error = "Codex 未运行，已暂停查询。";
+        } catch (FileNotFoundException) { }
+          catch (IOException) { return false; }
+          catch (UnauthorizedAccessException) { return false; }
+          catch (Exception ex) { Program.Log("invalid paused usage: " + ex.Message); }
+        return true;
     }
     static Dictionary<string, object> Obj(object o) { return o as Dictionary<string, object>; }
     static object Field(Dictionary<string, object> o, string k) { object v; return o != null && o.TryGetValue(k, out v) ? v : null; }
