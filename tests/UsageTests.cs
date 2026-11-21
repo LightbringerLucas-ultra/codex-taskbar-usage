@@ -201,6 +201,10 @@ internal static class UsageTests
             Check(ClientProcesses.IsClaudeCodeExecutable(@"C:\Users\Demo\.local\bin\claude.exe"), "standalone Claude Code installer");
             Check(!ClientProcesses.IsClaudeCodeExecutable(@"C:\Program Files\WindowsApps\Claude_1.0.0_x64\app\claude.exe"), "Claude Desktop does not start API polling");
             Check(!ClientProcesses.IsClaudeCodeExecutable(null), "a process that disappeared during inspection is ignored");
+            Check(UsageWidget.FitTaskbarLeft(8, 801, 228, 448, 581) == 220, "fit both readouts to the left of Start");
+            Check(UsageWidget.FitTaskbarLeft(8, 650, 900, 448, 700) == 202, "clamp a saved position even when only the quota fits");
+            Check(UsageWidget.FitTaskbarLeft(8, 600, -100, 448, 0) == 8, "clamp a position left of the taskbar");
+            Check(UsageWidget.FitTaskbarLeft(8, 400, 228, 448, 581) == null, "hide when even the minimum width would overlap Start");
             CheckNumbers();
             string directory = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "fixtures-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(directory);
