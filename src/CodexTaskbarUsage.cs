@@ -234,7 +234,6 @@ internal sealed class UsageWidget : Form
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr hwnd);
-    [DllImport("user32.dll", EntryPoint="SetWindowLongPtrW", SetLastError=true)] static extern IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int size);
     [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; public POINT(int x,int y) { X=x; Y=y; } }
     [StructLayout(LayoutKind.Sequential)] struct SIZE { public int X, Y; public SIZE(int x,int y) { X=x; Y=y; } }
@@ -265,9 +264,10 @@ internal sealed class UsageWidget : Form
     string error = "正在读取 Codex 用量";
     float scale = 1;
     object lastLayer, lastStatus;
-    IntPtr taskbarOwner, fullscreenCandidate;
+    IntPtr taskbarWindow, fullscreenCandidate;
     DateTime fullscreenSince, nextWindowCheck, nextRefresh, nextCreditRefresh, nextTaskbarCheck, nextLayerRefresh;
-    bool checkingTaskbar, checkingApps, apiSlotVisible;
+    bool checkingApps, apiSlotVisible;
+    Task<int?> startButtonCheck;
     CancellationTokenSource usageRequest, creditRequest;
     int? startButtonLeft;
     int requiredBalanceWidth;
@@ -474,17 +474,17 @@ internal sealed class UsageWidget : Form
         if (!codexOpen && !claudeCodeOpen) { HideWidget("Codex and Claude Code closed"); return; }
         var taskbar = FindWindow("Shell_TrayWnd", null);
         RECT r;
-        if (taskbar == IntPtr.Zero || !GetWindowRect(taskbar, out r)) { HideWidget("taskbar unavailable"); return; }
-        // An owned window stays above the taskbar when Explorer raises it on a click.
-        // Ownership does not inject code into Explorer or change its child windows.
-        if (taskbarOwner != taskbar) {
-            SetWindowLongPtr(Handle, -8, taskbar);
-            taskbarOwner = taskbar;
+        if (!GetWindowRect(taskbar, out r)) taskbar = IntPtr.Zero;
+        // Keep our own topmost window. Cross-process ownership couples Explorer's
+        // input queue to ours and makes our window lifetime depend on Explorer.
+        if (taskbarWindow != taskbar) {
+            taskbarWindow = taskbar;
             lastLayer = null;
             startButtonLeft = null;
+            startButtonCheck = null;
             nextTaskbarCheck = DateTime.MinValue;
         }
-        if (DateTime.UtcNow >= nextTaskbarCheck) CheckStartButton(taskbar);
+        if (taskbar == IntPtr.Zero) { HideWidget("taskbar unavailable"); return; }
         var screen = Screen.FromHandle(taskbar).Bounds;
         RECT f;
         var fg = GetForegroundWindow();
@@ -500,6 +500,8 @@ internal sealed class UsageWidget : Form
         } else fullscreenCandidate = IntPtr.Zero;
         bool taskbarVisible = IsWindowVisible(taskbar) && r.Top < screen.Bottom - 4 && r.Bottom > screen.Top + 4;
         if (!taskbarVisible || fullscreen) { HideWidget(fullscreen ? "stable fullscreen" : "taskbar hidden"); return; }
+        if (DateTime.UtcNow >= nextTaskbarCheck) CheckStartButton(taskbar);
+        if (!startButtonLeft.HasValue) { HideWidget("waiting for taskbar layout"); return; }
         uint dpi = 96;
         try { dpi = GetDpiForWindow(taskbar); } catch { }
         float nextScale = dpi / 96f;
@@ -507,15 +509,14 @@ internal sealed class UsageWidget : Form
         scale = nextScale;
         int baseWidth = (int)((WeeklyOnly ? 299 : 332) * scale);
         int height = Math.Min(r.Bottom - r.Top - 4, (int)(38 * scale));
-        if (height < 20 || r.Right - r.Left < baseWidth) { HideWidget("taskbar too small"); return; }
+        if (height < 20) { HideWidget("taskbar too small"); return; }
         int left = r.Left + 8;
-        int x = Math.Max(left, Math.Min(r.Left + (int)(offset * scale), r.Right - baseWidth - 8));
-        int right = Math.Min(r.Right - 8, startButtonLeft.GetValueOrDefault(r.Right) - (int)(9 * scale));
-        // With less space before Start, keep both readouts by moving the row only as far as needed.
-        if (right - x < requiredBalanceWidth && right - left >= requiredBalanceWidth)
-            x = right - requiredBalanceWidth;
+        int right = Math.Min(r.Right - 8, startButtonLeft.Value - (int)(9 * scale));
+        int? fittedLeft = FitTaskbarLeft(left, right, r.Left + (int)(offset * scale), baseWidth, requiredBalanceWidth);
+        if (!fittedLeft.HasValue) { HideWidget("not enough space before Start"); return; }
+        int x = fittedLeft.Value;
         int preferredWidth = Math.Max(baseWidth + (int)(98 * scale), requiredBalanceWidth);
-        int width = Math.Max(baseWidth, Math.Min(preferredWidth, right - x));
+        int width = Math.Min(preferredWidth, right - x);
         int y = r.Top + (r.Bottom - r.Top - height) / 2;
         if (!Visible) { lastLayer = null; Show(); }
         if (hiddenReason != null) Program.Log("taskbar widget restored after " + hiddenReason);
@@ -528,16 +529,30 @@ internal sealed class UsageWidget : Form
         DrawLayer();
         WriteStatus();
     }
+    internal static int? FitTaskbarLeft(int left, int right, int desiredLeft, int baseWidth, int balanceWidth)
+    {
+        int availableWidth = right - left;
+        if (availableWidth < baseWidth) return null;
+        // Make room for the full row when it fits. On a narrow taskbar preserve the quota section.
+        int minimumWidth = balanceWidth <= availableWidth ? Math.Max(baseWidth, balanceWidth) : baseWidth;
+        return Math.Max(left, Math.Min(desiredLeft, right - minimumWidth));
+    }
     async void CheckStartButton(IntPtr taskbar)
     {
-        if (checkingTaskbar) return;
-        checkingTaskbar = true;
+        if (startButtonCheck != null) return;
+        var lookup = Task.Run(() => FindStartButtonLeft(taskbar));
+        startButtonCheck = lookup;
         nextTaskbarCheck = DateTime.UtcNow.AddSeconds(8);
+        int? left = null;
         try {
-            var left = await Task.Run(() => FindStartButtonLeft(taskbar));
-            if (!IsDisposed && taskbarOwner == taskbar) startButtonLeft = left;
+            left = await lookup;
         } catch { }
-        finally { checkingTaskbar = false; }
+        // Explorer can restart while UI Automation is still querying its old window.
+        if (startButtonCheck != lookup) return;
+        startButtonCheck = null;
+        if (IsDisposed || closing) return;
+        startButtonLeft = left;
+        if (!left.HasValue) nextTaskbarCheck = DateTime.UtcNow.AddSeconds(1);
     }
     internal static int? FindStartButtonLeft(IntPtr taskbar)
     {
@@ -767,7 +782,7 @@ internal sealed class UsageWidget : Form
                 claudeCodeOpen = claudeCodeOpen, apiCreditPaused = !claudeCodeOpen, apiQueryRunning = creditRequest != null,
                 apiCreditError = claudeCodeOpen && apiCredit.Stale ? apiCredit.Note : null,
                 codexOpen = codexOpen, visible = Visible, x = Left, y = Top, width = Width, height = Height, scale = scale, offset = offset,
-                hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = taskbarOwner != IntPtr.Zero,
+                hideCount = hideCount, hiddenReason = hiddenReason, taskbarOwned = false,
                 job = Program.JobState,
                 error = stale ? error : null
             };

@@ -20,7 +20,7 @@ Codex 桌面版或 Claude Code 运行时，Windows 任务栏会显示额度看�
 
 - Windows，.NET Framework 4.x（构建需要系统自带的 C# 编译器）
 - 安装并登录 Codex 桌面版；程序在 `%LOCALAPPDATA%\OpenAI\Codex\bin` 中查找 `codex.exe`
-- 主屏幕使用底部任务栏；任务栏隐藏或前台全屏时看板自动隐藏
+- 主屏幕使用底部任务栏，开始按钮左侧有足够空间时显示看板。任务栏隐藏或前台全屏时，看板会自动隐藏。
 
 刷新 API 余额还需要 Claude Code 的 Windows 命令行可执行文件、Node.js、通过 npm 安装在用户默认目录中的 [OpenCLI](https://github.com/jackwener/opencli)，以及与 OpenCLI Browser Bridge 连接的 Edge。在该浏览器配置中登录 [OpenAI Platform](https://platform.openai.com/home)。程序读取首页的 `Credit remaining`，无需 API Key 或管理员 Key。
 
